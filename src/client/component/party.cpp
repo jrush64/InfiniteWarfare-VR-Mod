@@ -1,0 +1,1597 @@
+#include <std_include.hpp>
+#include "loader/component_loader.hpp"
+
+#include "party.hpp"
+
+#include "steam/steam.hpp"
+
+#include "game/game.hpp"
+
+#include "command.hpp"
+#include "console/console.hpp"
+#include "network.hpp"
+#include "profile_infos.hpp"
+#include "scheduler.hpp"
+#include "server_list.hpp"
+#include "download.hpp"
+#include "fastfiles.hpp"
+
+#include "utils/hash.hpp"
+
+#include <utils/string.hpp>
+#include <utils/info_string.hpp>
+#include <utils/hook.hpp>
+#include <utils/cryptography.hpp>
+#include <utils/io.hpp>
+
+namespace party
+{
+	fake_member_info_t g_clientMemberInfo[18]; 
+	fake_member_info_t g_memberInfo[18];
+	bool g_clientMemberInfoValid[18];
+	bool g_memberInfoValid[18];
+
+	namespace
+	{
+		std::string get_dvar_string(const std::string& dvar)
+		{
+			auto* dvar_value = game::Dvar_FindVar(dvar.data());
+			if (dvar_value && dvar_value->current.string)
+			{
+				return dvar_value->current.string;
+			}
+
+			return {};
+		}
+
+		int get_dvar_int(const std::string& dvar)
+		{
+			auto* dvar_value = game::Dvar_FindVar(dvar.data());
+			if (dvar_value && dvar_value->current.integer)
+			{
+				return dvar_value->current.integer;
+			}
+
+			return -1;
+		}
+
+		bool get_dvar_bool(const std::string& dvar)
+		{
+			auto* dvar_value = game::Dvar_FindVar(dvar.data());
+			if (dvar_value && dvar_value->current.enabled)
+			{
+				return dvar_value->current.enabled;
+			}
+
+			return false;
+		}
+	}
+
+	namespace mods
+	{
+		void set_mod(const std::string& path, bool [[maybe_unused]] change_fs_game = false)
+		{
+			game::Dvar_SetFromStringByName("fs_game", path.data(), game::DvarSetSource::DVAR_SOURCE_INTERNAL);
+		}
+	}
+
+	namespace
+	{
+		struct fastdl_file
+		{
+			std::string extension;
+			std::string name;
+			bool optional;
+			bool localized = false;
+		};
+
+		std::vector<fastdl_file> usermap_files =
+		{
+			{".ff", "usermap_hash", false},
+			{"_load.ff", "usermap_load_hash", true},
+			{"_art.ff", "usermap_art_hash", true},
+			{".arena", "usermap_arena_hash", true},
+			{".pak", "usermap_pak_hash", true},
+			{".sabl", "usermap_sabl_hash", true},
+			{".sabs", "usermap_sabs_hash", true},
+			{".ff", "usermap_loc_hash", true, true},
+		};
+
+		std::vector<fastdl_file> mod_files =
+		{
+			{".ff", "mod_hash", false},
+			{".sabl", "sabl_hash", true},
+			{".sabs", "sabs_hash", true},
+		};
+
+		std::unordered_map<std::string, std::string> hash_cache;
+
+		const game::dvar_t* sv_say_name = nullptr;
+
+		std::string get_file_hash(const std::string& file)
+		{
+			const auto iter = hash_cache.find(file);
+			if (iter != hash_cache.end())
+			{
+				return iter->second;
+			}
+
+			const auto hash = utils::hash::get_file_hash(file);
+			if (!hash.empty())
+			{
+				hash_cache.insert(std::make_pair(file, hash));
+			}
+
+			return hash;
+		}
+
+		std::string get_usermap_file_path(const std::string& mapname, const std::string& extension)
+		{
+			return std::format("usermaps\\{}\\{}{}", mapname, mapname, extension);
+		}
+
+		std::string get_usermap_file_path(const std::string& mapname, const fastdl_file& file)
+		{
+			if (file.localized)
+			{
+				return std::format("usermaps\\{}\\{}_{}{}", mapname, game::SEH_GetCurrentLanguageCode(), mapname, file.extension);
+			}
+			return get_usermap_file_path(mapname, file.extension);
+		}
+
+		// generate hashes so they are cached
+		void generate_hashes(const std::string& mapname)
+		{
+			for (const auto& file : usermap_files)
+			{
+				const auto path = get_usermap_file_path(mapname, file);
+				get_file_hash(path);
+			}
+
+			// mod
+			const auto fs_game = get_dvar_string("fs_game");
+			if (!fs_game.empty())
+			{
+				for (const auto& file : mod_files)
+				{
+					const auto path = std::format("{}\\mod{}", fs_game, file.extension);
+					get_file_hash(path);
+				}
+			}
+		}
+
+		void check_download_map(const utils::info_string& info, std::vector<download::file_t>& files)
+		{
+			const auto mapname = info.get("mapname");
+			if (fastfiles::is_stock_map(mapname))
+			{
+				return;
+			}
+
+			if (mapname.contains('.') || mapname.contains("::"))
+			{
+				throw std::runtime_error(utils::string::va("Invalid server mapname value '%s'", mapname.data()));
+			}
+
+			const auto check_file = [&](const fastdl_file& file)
+			{
+				auto filename = get_usermap_file_path(mapname, file);
+				std::ranges::replace(filename, '\\', '/');
+				const auto source_hash = info.get(file.name);
+				if (source_hash.empty())
+				{
+					if (!file.optional)
+					{
+						std::string missing_value = "Server '%s' is empty";
+						if (file.name == "usermap_hash"s)
+						{
+							missing_value += " (or you are missing content for map '%s')";
+						}
+						throw std::runtime_error(utils::string::va(missing_value.data(), file.name.data(), mapname.data()));
+					}
+
+					return;
+				}
+
+				const auto hash = get_file_hash(filename);
+				console::debug("hash != source_hash => %s != %s\n", source_hash.data(), hash.data());
+				if (hash != source_hash)
+				{
+					files.emplace_back(filename, source_hash);
+					return;
+				}
+			};
+
+			for (const auto& file : usermap_files)
+			{
+				check_file(file);
+			}
+		}
+
+		bool check_download_mod(const utils::info_string& info, std::vector<download::file_t>& files)
+		{
+			static const auto fs_game = game::Dvar_FindVar("fs_game");
+			const auto client_fs_game = utils::string::to_lower(fs_game->current.string);
+			const auto server_fs_game = utils::string::to_lower(info.get("fs_game"));
+
+			if (server_fs_game.empty() && client_fs_game.empty())
+			{
+				return false;
+			}
+
+			if (server_fs_game.empty() && !client_fs_game.empty())
+			{
+				mods::set_mod("");
+				return true;
+			}
+
+			if (!server_fs_game.starts_with("mods/") || server_fs_game.contains('.') || server_fs_game.contains("::"))
+			{
+				throw std::runtime_error(utils::string::va("Invalid server fs_game value '%s'", server_fs_game.data()));
+			}
+
+			auto needs_restart = false;
+			for (const auto& file : mod_files)
+			{
+				const auto source_hash = info.get(file.name);
+				if (source_hash.empty())
+				{
+					if (file.optional)
+					{
+						continue;
+					}
+
+					throw std::runtime_error(
+						utils::string::va("Server '%s' is empty", file.name.data()));
+				}
+
+				const auto file_path = server_fs_game + "/mod" + file.extension;
+				auto has_to_download = !utils::io::file_exists(file_path);
+
+				if (!has_to_download)
+				{
+					const auto hash = get_file_hash(file_path);
+					console::debug("has_to_download = %s != %s\n", source_hash.data(), hash.data());
+					has_to_download = source_hash != hash;
+				}
+
+				if (has_to_download)
+				{
+					// unload mod before downloading it
+					if (client_fs_game == server_fs_game)
+					{
+						mods::set_mod("", true);
+						return true;
+					}
+					else
+					{
+						files.emplace_back(file_path, source_hash);
+					}
+				}
+				else if (client_fs_game != server_fs_game)
+				{
+					mods::set_mod(server_fs_game);
+					needs_restart = true;
+				}
+			}
+
+			return needs_restart;
+		}
+
+		/*std::string get_whitelist_json_path()
+		{
+			return (utils::properties::get_appdata_path() / "whitelist.json").generic_string();
+		}
+
+		nlohmann::json get_whitelist_json_object()
+		{
+			std::string data;
+			if (!utils::io::read_file(get_whitelist_json_path(), &data))
+			{
+				return nullptr;
+			}
+
+			nlohmann::json obj;
+			try
+			{
+				obj = nlohmann::json::parse(data.data());
+			}
+			catch (const nlohmann::json::parse_error& ex)
+			{
+				game::shared::menu_error(utils::string::va("%s\n", ex.what()));
+				return nullptr;
+			}
+
+			return obj;
+		}
+
+		std::string target_ip_to_string(const game::netadr_s& target)
+		{
+			return utils::string::va("%i.%i.%i.%i",
+				static_cast<int>(saved_info_response.host.ip[0]),
+				static_cast<int>(saved_info_response.host.ip[1]),
+				static_cast<int>(saved_info_response.host.ip[2]),
+				static_cast<int>(saved_info_response.host.ip[3]));
+		}
+
+		bool should_user_confirm(const game::netadr_s& target)
+		{
+			nlohmann::json obj = get_whitelist_json_object();
+			if (obj != nullptr)
+			{
+				const auto target_ip = target_ip_to_string(target);
+				for (const auto& [key, value] : obj.items())
+				{
+					if (value.is_string() && value.get<std::string>() == target_ip)
+					{
+						return false;
+					}
+				}
+			}
+
+			//close_joining_popups();
+			command::execute("lui_open_popup popup_confirmdownload", false);
+
+			return true;
+		}*/
+
+		bool needs_vid_restart = false;
+
+		bool download_files(const game::netadr_s& target, const utils::info_string& info, bool allow_download)
+		{
+			try
+			{
+				std::vector<download::file_t> files{};
+
+				const auto needs_restart = check_download_mod(info, files);
+				needs_vid_restart = needs_vid_restart || needs_restart;
+				check_download_map(info, files);
+
+				if (files.size() > 0)
+				{
+					if (!allow_download/* && should_user_confirm(target)*/)
+					{
+						return true;
+					}
+
+					download::stop_download();
+					download::start_download(target, info, files);
+					return true;
+				}
+				else if (needs_restart || needs_vid_restart)
+				{
+					command::execute("vid_restart");
+					needs_vid_restart = false;
+					scheduler::once([=]()
+					{
+						//mods::read_stats();
+						connect(target);
+					}, scheduler::pipeline::main);
+					return true;
+				}
+			}
+			catch (const std::exception& e)
+			{
+				command::execute("luiLeaveMenu AcceptingInvite", true);
+				game::shared::menu_error(e.what());
+				return true;
+			}
+
+			return false;
+		}
+	}
+
+	namespace
+	{
+		connection_state server_connection_state{};
+		std::optional<discord_information> server_discord_info{};
+
+		bool preloaded_map = false;
+
+		void xstartlobby()
+		{
+			const int privateMatch = game::Dvar_FindVar("xblive_privatematch")->current.integer;
+			const int maxPlayers = game::Dvar_FindVar("party_maxplayers")->current.integer;
+			const int privateClients = game::Dvar_FindVar("ui_privateClients")->current.integer;
+			const int availableSpots = maxPlayers - privateClients;
+
+			auto partyData = game::Lobby_GetPartyData();
+
+			// stop current party and reset settings
+			utils::hook::invoke<void>(0x1409D07B0, partyData); // Party_StopParty
+			utils::hook::invoke<void>(0x1409CAB20, partyData, 0, 1); // Party_Awake
+			utils::hook::invoke<void>(0x1409D0050); // Party_ResetTweakDvars
+			utils::hook::invoke<void>(0x1409CB460, partyData); // Voice_DisableLocalMics
+
+			utils::hook::invoke<void>(0x140D330B0, 0); // Live_SetLobbyPresence
+
+			if (!privateMatch && !game::environment::is_dedi())
+			{
+				utils::hook::invoke<void>(0x140CCD840, 0, 0); // Playlist_RunRule
+			}
+
+			const int flags = utils::hook::invoke<int>(0x140D9B200, 0); // PartyHost_GetCreateFlags
+
+			// initialize lobby
+			utils::hook::invoke<void>(0x1409D9940, partyData, 0, 0, flags, privateClients, availableSpots);
+		}
+
+		enum class vote_result
+		{
+			not_ready,
+			skipped,
+			started,
+		};
+
+		vote_result party_host_start_map_vote(const int controller, const int vote_time, const int lobby_time)
+		{
+			auto* party = game::Lobby_GetPartyData();
+			if (!party || !game::Party_IsRunning(party) || !game::Party_AreWeHost(party))
+			{
+				return vote_result::not_ready;
+			}
+
+			static const auto* xblive_privatematch = game::Dvar_FindVar("xblive_privatematch");
+			if (xblive_privatematch && xblive_privatematch->current.enabled)
+			{
+				return vote_result::skipped;
+			}
+
+			const auto state = party->lobbyFlags & game::PARTY_LOBBY_STATE_MASK;
+
+			if (state == game::PARTY_LOBBY_STATE_MAP_VOTE // already voting (returned from a match)
+				|| party->gameStartRequested)
+			{
+				return vote_result::skipped;
+			}
+
+			if (state != game::PARTY_LOBBY_STATE_IDLE)
+			{
+				return vote_result::not_ready;
+			}
+
+			game::PartyHost_ChooseMapVoteEntries(controller);
+			game::PartyHost_ClearMapVotes(party);
+
+			const auto now = game::Sys_Milliseconds();
+			party->mapVotePassed = false;
+			party->mapVoteEndTime = now + vote_time * 1000;
+			party->lobbyEndTime = now + std::max(lobby_time, vote_time) * 1000;
+			party->mapVoteCast = 0;
+			party->lobbyFlags = (party->lobbyFlags & ~0x3C) | game::PARTY_LOBBY_STATE_MAP_VOTE;
+
+			game::PartyHost_GamestateChanged(party);
+			return vote_result::started;
+		}
+
+		void update_usermap(const std::string& mapname)
+		{
+			if (fastfiles::is_stock_map(mapname))
+			{
+				fastfiles::clear_usermap();
+				return;
+			}
+
+			fastfiles::set_usermap(mapname);
+		}
+
+		void perform_game_initialization(const int max_clients, const bool private_match)
+		{
+			const auto ui_maxclients = game::Dvar_FindVar("ui_maxclients");
+			const auto party_maxplayers = game::Dvar_FindVar("party_maxplayers");
+			game::Dvar_SetInt(ui_maxclients, max_clients);
+			game::Dvar_SetInt(party_maxplayers, max_clients);
+
+			const auto xblive_privatematch = game::Dvar_FindVar("xblive_privatematch");
+			game::Dvar_SetBool(xblive_privatematch, private_match);
+
+			xstartlobby();
+
+			command::execute("uploadstats", true);
+		}
+
+		void connect_to_party(const game::netadr_s& target, const std::string& mapname, const std::string& gametype, int sv_maxclients, const bool private_match)
+		{
+			const auto mode = game::Com_GameMode_GetActiveGameMode();
+			if (mode != game::GAME_MODE_MP && mode != game::GAME_MODE_CP)
+			{
+				return;
+			}
+
+			if (game::Live_SyncOnlineDataFlags(0) != 0)
+			{
+				scheduler::once([=]()
+				{
+					connect_to_party(target, mapname, gametype, sv_maxclients, private_match);
+				}, scheduler::pipeline::main, 1s);
+				return;
+			}
+
+			game::Dvar_SetFromStringByName("ui_combat_training", "0", game::DVAR_SOURCE_INTERNAL);
+
+			perform_game_initialization(sv_maxclients, private_match);
+
+			game::Dvar_SetFromStringByName("ui_mapname", mapname.data(), game::DVAR_SOURCE_INTERNAL);
+			game::Dvar_SetFromStringByName("ui_gametype", gametype.data(), game::DVAR_SOURCE_INTERNAL);
+
+			utils::hook::invoke<void>(0x140C19B00, gametype.data()); // setup agent count
+
+			preloaded_map = false;
+
+			update_usermap(mapname);
+
+			// connect
+			char session_info[0x100] = {};
+			game::CL_MainMP_ConnectAndPreloadMap(0, reinterpret_cast<void*>(session_info), &target, mapname.data(), gametype.data());
+		}
+
+		void start_map_for_party(std::string map_name)
+		{
+			[[maybe_unused]] auto* mapname = game::Dvar_FindVar("ui_mapname");
+			auto* ui_gametype = game::Dvar_FindVar("ui_gametype");
+			auto* ui_maxclients = game::Dvar_FindVar("ui_maxclients");
+			auto* ui_privateClients = game::Dvar_FindVar("ui_privateClients");
+			auto* ui_hardcore = game::Dvar_FindVar("ui_hardcore");
+
+			if (!ui_gametype)
+			{
+				console::error("Failed to start map for party. ui_gametype was undefined");
+				return;
+			}
+
+			if (game::Com_FrontEnd_IsInFrontEnd())
+			{
+				// Com_FrontEndScene_ShutdownAndDisable
+				utils::hook::invoke<void>(0x1405AEFB0);
+			}
+
+			game::SV_CmdsMP_StartMapForParty(
+				map_name.data(),
+				ui_gametype->current.string,
+				ui_maxclients != nullptr ? ui_maxclients->current.integer : 18,
+				ui_privateClients != nullptr ? ui_privateClients->current.integer : 0,
+				ui_hardcore != nullptr ? ui_hardcore->current.integer : 0,
+				false,
+				false);
+		}
+
+		void com_gamestart_beginclient_stub(const char* mapname, const char* gametype, char a3)
+		{
+			if (preloaded_map)
+			{
+				// Com_GameStart_BeginClient
+				utils::hook::invoke<void>(0x1405B0130, mapname, gametype, a3);
+			}
+			else
+			{
+				// DB_LoadLevelXAssets
+				utils::hook::invoke<void>(0x1403B9C90, mapname, 0);
+			}
+		}
+
+		void com_restart_for_frontend_stub()
+		{
+			if (preloaded_map)
+			{
+				// Com_RestartForFrontend
+				utils::hook::invoke<void>(0x140BAF0B0);
+			}
+			else
+			{
+				// Com_Restart
+				utils::hook::invoke<void>(0x140BAF0A0);
+			}
+		}
+
+		std::string current_sv_mapname;
+
+		utils::hook::detour sv_start_map_for_party_hook;
+		void sv_start_map_for_party_stub(const char* map, const char* game_type, int client_count, int agent_count, bool hardcore,
+			bool map_is_preloaded, bool migrate)
+		{
+			update_usermap(map);
+
+			hash_cache.clear();
+			current_sv_mapname = map;
+
+			if (game::environment::is_dedi())
+			{
+				generate_hashes(map);
+			}
+
+			preloaded_map = map_is_preloaded;
+			sv_start_map_for_party_hook.invoke<void>(map, game_type, client_count, agent_count, hardcore, map_is_preloaded, migrate);
+		}
+
+		void set_new_map(const char* mapname, const char* gametype, game::msg_t* msg)
+		{
+			if (game::SV_Loaded())
+			{
+				utils::hook::invoke<void>(0x1409B3FE0, mapname, gametype);
+				return;
+			}
+
+			if (fastfiles::is_stock_map(mapname))
+			{
+				fastfiles::clear_usermap();
+				utils::hook::invoke<void>(0x1409B3FE0, mapname, gametype);
+				return;
+			}
+
+			fastfiles::set_usermap(mapname);
+
+			for (const auto& file : usermap_files)
+			{
+				char buffer[0x100] = {0};
+				const std::string source_hash = game::MSG_ReadStringLine(msg,
+					buffer, static_cast<unsigned int>(sizeof(buffer)));
+
+				const auto path = get_usermap_file_path(mapname, file);
+				const auto hash = get_file_hash(path);
+
+				if ((!source_hash.empty() && hash != source_hash) || (source_hash.empty() && !file.optional))
+				{
+					command::execute("disconnect");
+					scheduler::once([]
+					{
+						connect(server_connection_state.host);
+					}, scheduler::pipeline::main);
+					return;
+				}
+			}
+
+			utils::hook::invoke<void>(0x1409B3FE0, mapname, gametype);
+		}
+
+		void loading_new_map_cl_stub(utils::hook::assembler& a)
+		{
+			a.pushad64();
+			a.mov(r8, r12);
+			a.call_aligned(set_new_map);
+			a.popad64();
+
+			a.jmp(0x1409B04D7);
+		}
+
+		utils::hook::detour net_out_of_band_print_hook;
+		void net_out_of_band_print_stub(game::netsrc_t sock, game::netadr_s* addr, const char* data)
+		{
+			if (!std::strstr(data, "loadingnewmap"))
+			{
+				return net_out_of_band_print_hook.invoke<void>(sock, addr, data);
+			}
+
+			std::string buffer{};
+			const auto line = [&](const std::string& data_)
+			{
+				buffer.append(data_);
+				buffer.append("\n");
+			};
+
+			const auto* sv_gametype = game::Dvar_FindVar("g_gametype");
+			line("loadingnewmap");
+			line(current_sv_mapname);
+			line(sv_gametype->current.string);
+
+			const auto is_usermap = fastfiles::usermap_exists(current_sv_mapname);
+			for (const auto& file : usermap_files)
+			{
+				if (is_usermap)
+				{
+					const auto filename = get_usermap_file_path(current_sv_mapname, file);
+					const auto hash = get_file_hash(filename);
+					line(hash);
+				}
+				else
+				{
+					line("");
+				}
+			}
+
+			net_out_of_band_print_hook.invoke<void>(sock, addr, buffer.data());
+		}
+
+		void reset_mem_stuff(game::SvServerInitSettings* init_settings)
+		{
+			if (init_settings->maxClientCount != *game::svs_numclients)
+			{
+				game::Com_Error(game::ERR_DROP, reinterpret_cast<const char*>(0x141512140));
+			}
+
+			if (!init_settings->serverThreadStartup)
+			{
+				if (!init_settings->isRestart)
+				{
+					// Nav_AllocNavPower
+					memset(&*reinterpret_cast<__int64*>(0x144E3A490 + 8), 0, 0x78680ui64 - 8);
+				}
+			}
+		}
+
+		void reset_mem_stuff_stub(utils::hook::assembler& a)
+		{
+			a.pushad64();
+
+			a.mov(rcx, rbx);
+			a.call_aligned(reset_mem_stuff);
+
+			a.popad64();
+
+			a.jmp(0x140C563E2);
+		}
+
+		void send_user_info()
+		{
+			utils::hook::invoke<void>(0x1409B3EB0, 0); // CL_MainMP_SendUserInfoCmd
+		}
+
+		void cl_initialize_gamestate_stub(int local_client_num)
+		{
+			if (!game::Com_IsAnyLocalServerRunning())
+			{
+				send_user_info();
+			}
+
+			utils::hook::invoke<void>(0x1409B2FA0, local_client_num);
+		}
+
+		utils::hook::detour sv_set_player_info_string_hook;
+		void sv_set_player_info_string_stub(int clientNum, const char* xuidString, const char* xnaddrString, const char* natTypeString, const char* npIdString, const char* partyIpString)
+		{
+			uint64_t xuid64{};
+			game::StringToXUID(xuidString, &xuid64);
+			const auto lobby = game::SV_MainMP_GetServerLobby();
+			if (game::Session_FindRegisteredUser(lobby, xuid64) == 0xFFFFFFFFui64)
+			{
+				const auto client = game::svs_clients[clientNum];
+				const auto privateSlot = clientNum < game::SV_GameMP_GetAgentCount();
+				game::Session_RegisterRemotePlayer(0, lobby, xuid64, privateSlot, clientNum, std::atoi(natTypeString), const_cast<char*>(xnaddrString), &client->remoteAddress);
+			}
+
+			console::info("Setting client %i XUID to %s\n", clientNum, xuidString);
+			sv_set_player_info_string_hook.invoke<void>(clientNum, xuidString, xnaddrString, natTypeString, npIdString, partyIpString);
+		}
+
+		utils::hook::detour party_host_conclude_map_vote_hook;
+		void party_host_conclude_map_vote(game::PartyData* party, const int controller)
+		{
+			party_host_conclude_map_vote_hook.invoke<void>(party, controller);
+			game::Dvar_SetFromStringByName("ui_oldmapname", "", game::DVAR_SOURCE_INTERNAL);
+		}
+
+		utils::hook::detour party_host_start_match_internal_hook;
+		void party_host_start_match_internal(game::PartyData* party, const game::PartyActiveClient* mainActiveClient)
+		{
+			if (!game::environment::is_dedi() && !game::Dvar_FindVar("xblive_privatematch")->current.enabled
+				&& !party->mapVotePassed && (party->lobbyFlags & game::PARTY_LOBBY_STATE_MASK) == game::PARTY_LOBBY_STATE_MAP_VOTE)
+			{
+				game::PartyHost_ConcludeMapVote(party, static_cast<int>(mainActiveClient->localControllerIndex));
+			}
+
+			const auto* mapname = game::Dvar_FindVar("ui_mapname");
+			if (!game::DB_FileExists(mapname->current.string))
+			{
+				game::UI_MissingMapError();
+			}
+			else
+			{
+				party_host_start_match_internal_hook.invoke<void>(party, mainActiveClient);
+			}
+		}
+
+		bool content_do_we_have_content_pack(int idx)
+		{
+			return true;
+		}
+
+		bool party_host_map_is_acceptable(uintptr_t party, const char* mapname, const int playlistId)
+		{
+			if (game::Live_GetMapIndex(mapname) < 0 || game::DB_FileExists(mapname))
+			{
+				return 1;
+			}
+			return 0;
+		}
+
+		void private_map_rotation_set_initial_map_selection(game::LobbyMapRotation* mapRot, unsigned int initialMapIndex)
+		{
+			if (!mapRot) return;
+			mapRot->lastPlayedIndex = 0xFFFF;
+			mapRot->nextIndex = initialMapIndex;
+
+			const auto count = std::min(mapRot->entryCount, static_cast<unsigned int>(ARRAYSIZE(mapRot->entry)));
+
+			std::vector<unsigned int> installed;
+			for (unsigned int i = 0; i < count; ++i)
+			{
+				const char* mapname = mapRot->entry[i].name;
+				if (mapname && *mapname && game::DB_FileExists(mapname))
+				{
+					mapRot->entry[i].weight = 1;
+					installed.push_back(i);
+				}
+				else
+				{
+					mapRot->entry[i].weight = 0;
+				}
+			}
+
+			if (installed.empty()) return;
+
+			const auto picked = installed[utils::cryptography::random::get_integer() % installed.size()];
+			mapRot->nextIndex = picked;
+			game::Dvar_SetFromStringByName("ui_mapname", mapRot->entry[picked].name, game::DVAR_SOURCE_INTERNAL);
+		}
+	}
+
+	game::GameModeType get_game_mode_from_mapname(const std::string& mapname)
+	{
+		if (mapname.find("mp_") == 0)
+		{
+			return game::GAME_MODE_MP;
+		}
+		else if (mapname.find("cp_") == 0)
+		{
+			return game::GAME_MODE_CP;
+		}
+
+		return game::GAME_MODE_SP;
+	}
+
+	void start_map(const std::string& mapname, bool dev)
+	{
+		if (game::Com_GameMode_GetActiveGameMode() == game::GAME_MODE_SP)
+		{
+			console::info("Starting sp map: %s\n", mapname.data());
+			command::execute(utils::string::va("spmap %s", mapname.data()), false);
+			return;
+		}
+
+		if (game::Live_SyncOnlineDataFlags(0) != 0)
+		{
+			scheduler::once([=]()
+			{
+				game::Com_GameMode_SetDesiredGameMode(get_game_mode_from_mapname(mapname));
+				start_map(mapname, dev);
+			}, scheduler::pipeline::main, 1s);
+			return;
+		}
+
+		if (mapname.empty())
+		{
+			console::error("No map specified.\n");
+			return;
+		}
+
+		update_usermap(mapname);
+
+		if (!game::SV_MapExists(mapname.data()))
+		{
+			console::error("Map \"%s\" doesn't exist.\n", mapname.data());
+			return;
+		}
+
+		if (!game::Com_GameMode_SupportsMap(mapname.data()))
+		{
+			console::error("Cannot load map \"%s\" in current game mode.\n", mapname.data());
+			return;
+		}
+
+		auto* current_mapname = game::Dvar_FindVar("mapname");
+
+		if (dev)
+		{
+			command::execute("seta sv_cheats 1", true);
+		}
+
+		if (current_mapname && utils::string::to_lower(current_mapname->current.string) ==
+			utils::string::to_lower(mapname) && (game::SV_Loaded() && !game::Com_FrontEndScene_IsActive()))
+		{
+			console::info("Restarting map: %s\n", mapname.data());
+			command::execute("map_restart", false);
+			return;
+		}
+
+		if (!game::environment::is_dedi())
+		{
+			game::Dvar_SetFromStringByName("ui_combat_training", "0", game::DVAR_SOURCE_INTERNAL);
+		}
+
+		if (!game::Lobby_GetPartyData()->party_systemActive || game::Com_FrontEnd_IsInFrontEnd())
+		{
+			if (game::environment::is_dedi())
+			{
+				perform_game_initialization(game::Dvar_FindVar("party_maxplayers")->current.integer, false);
+			}
+			else
+			{
+				perform_game_initialization(game::Dvar_FindVar("party_maxplayers")->current.integer,
+					game::Dvar_FindVar("xblive_privatematch")->current.integer);
+			}
+		}
+
+		command::execute(utils::string::va("seta ui_mapname %s", mapname.data()), true);
+
+		if (auto* gametype = game::Dvar_FindVar("g_gametype");
+		    gametype && gametype->current.string && gametype->current.string != "frontend"s)
+		{
+			command::execute(utils::string::va("seta ui_gametype %s", gametype->current.string), true);
+		}
+
+		if (auto* hardcore = game::Dvar_FindVar("g_hardcore"); hardcore)
+		{
+			command::execute(utils::string::va("seta ui_hardcore %d", hardcore->current.enabled), true);
+		}
+
+		console::info("Starting map: %s\n", mapname.data());
+
+		start_map_for_party(mapname);
+		return;
+	}
+
+	int get_client_num_by_name(const std::string& name)
+	{
+		for (unsigned int i = 0; !name.empty() && i < *game::svs_numclients; ++i)
+		{
+			if (game::g_entities[i].client)
+			{
+				char client_name[32] = { 0 };
+				strncpy_s(client_name, game::g_entities[i].client->sess.name, sizeof(client_name));
+				game::I_CleanStr(client_name);
+
+				if (client_name == name)
+				{
+					return i;
+				}
+			}
+		}
+		return -1;
+	}
+
+	void reset_server_connection_state()
+	{
+		server_connection_state = {};
+	}
+
+	unsigned int get_client_count()
+	{
+		auto count = 0;
+		const auto* svs_clients = *game::svs_clients;
+		for (unsigned int i = 0; i < *game::svs_numclients; ++i)
+		{
+			if (svs_clients[i].header.state >= 1)
+			{
+				++count;
+			}
+		}
+
+		return count;
+	}
+
+	unsigned int get_bot_count()
+	{
+		auto count = 0;
+		const auto* svs_clients = *game::svs_clients;
+		for (unsigned int i = 0; i < *game::svs_numclients; ++i)
+		{
+			if (svs_clients[i].header.state >= 1 &&
+				game::SV_BotIsBot(i))
+			{
+				++count;
+			}
+		}
+
+		return count;
+	}
+
+	void connect(const game::netadr_s& target)
+	{
+		command::execute("luiOpenPopup AcceptingInvite", true);
+
+		profile_infos::clear_profile_infos();
+
+		server_connection_state.host = target;
+		server_connection_state.challenge = utils::cryptography::random::get_challenge();
+		server_connection_state.hostDefined = true;
+
+		network::send(target, "getInfo", server_connection_state.challenge);
+	}
+
+	void info_response_error(const std::string& error)
+	{
+		command::execute("luiLeaveMenu AcceptingInvite", true);
+
+		game::shared::menu_error(error);
+	}
+
+	void clear_sv_motd()
+	{
+		server_connection_state.motd.clear();
+	}
+
+	connection_state* get_server_connection_state()
+	{
+		return &server_connection_state;
+	}
+
+	std::optional<discord_information> get_server_discord_info()
+	{
+		return server_discord_info;
+	}
+
+	static int find_client_num_by_adr(const game::netadr_s& from)
+	{ 
+		for (unsigned int i = 0; i < *game::svs_numclients; i++) 
+		{ 
+			auto client = game::svs_clients[i];
+			if (game::NET_CompareAdr(from, client->remoteAddress))
+				return i; 
+		} 
+		return -1; 
+	}
+
+	class component final : public component_interface
+	{
+	public:
+		void post_unpack() override
+		{
+			static const char* a1 = "map_sp";
+			static const char* a2 = "map_restart_sp";
+			static const char* a3 = "fast_restart_sp";
+
+			// patch singleplayer "map" -> "map_sp"
+			utils::hook::set(0x141BBA800 + 0, a1);
+			utils::hook::set(0x141BBA800 + 24, a1);
+			utils::hook::set(0x141BBA800 + 56, a1);
+
+			// patch singleplayer map_restart -> "map_restart_sp"
+			utils::hook::set(0x141BBA740 + 0, a2);
+			utils::hook::set(0x141BBA740 + 24, a2);
+			utils::hook::set(0x141BBA740 + 56, a2);
+
+			// patch singleplayer fast_restart -> "fast_restart_sp"
+			utils::hook::set(0x141BBA700 + 0, a3);
+			utils::hook::set(0x141BBA700 + 24, a3);
+			utils::hook::set(0x141BBA700 + 56, a3);
+
+			utils::hook::set<uint8_t>(0x140C562FD, 0xEB); // allow mapname to be changed while server is running
+
+			utils::hook::nop(0x140A7A8DF, 5); // R_SyncRenderThread inside CL_MainMp_PreloadMap ( freezes )
+
+			utils::hook::call(0x1409AFE84, com_gamestart_beginclient_stub); // blackscreen issue on connect
+			utils::hook::call(0x1409B4077, com_gamestart_beginclient_stub); // may not be necessary (map rotate)
+			utils::hook::call(0x1409B404A, com_restart_for_frontend_stub); // may not be necessary (map rotate)
+
+			sv_start_map_for_party_hook.create(0x140C4D150, sv_start_map_for_party_stub);
+
+			utils::hook::jump(0x1409B04D2, utils::hook::assemble(loading_new_map_cl_stub), true);
+			net_out_of_band_print_hook.create(game::NET_OutOfBandPrint, net_out_of_band_print_stub);
+
+			utils::hook::nop(0x140C563C3, 12); // far jump = 12 bytes
+			utils::hook::jump(0x140C563C3, utils::hook::assemble(reset_mem_stuff_stub), true);
+
+			// show custom drop reason
+			utils::hook::set<uint8_t>(0x1409B0AFF, 0xEB);
+
+			// enable custom kick reason in GScr_KickPlayer
+			utils::hook::set<uint8_t>(0x140B5377E, 0xEB);
+
+			utils::hook::call(0x1409B70A1, cl_initialize_gamestate_stub);
+			sv_set_player_info_string_hook.create(0x140C57360, sv_set_player_info_string_stub);
+
+			game::Dvar_RegisterBool("lui_checkIfLevelInFileSystem", true, game::DVAR_FLAG_NONE, "Filters the level select menu to display only those which are installed");
+			utils::hook::jump(0x140CE8550, content_do_we_have_content_pack); // do not check content bits. instead check for fastfile existence
+			utils::hook::jump(0x1409D7680, party_host_map_is_acceptable); // mapvote only choose maps that are installed
+			utils::hook::jump(0x140E7B480, private_map_rotation_set_initial_map_selection);
+			party_host_start_match_internal_hook.create(0x1409D97D0, party_host_start_match_internal);
+			party_host_conclude_map_vote_hook.create(game::PartyHost_ConcludeMapVote, party_host_conclude_map_vote);
+
+			// enable xpartygo in public match
+			utils::hook::nop(0x1409AA7D0, 6); 
+			utils::hook::nop(0x1409D8931, 0x13);
+
+			// skips cpu and bandwidth requirements to host a public match
+			utils::hook::set(0x140DC65B0, 0xC301B0); 
+			utils::hook::set(0x140DC6580, 0xC301B0);
+
+			command::add("map", [](const command::params& args)
+			{
+				if (args.size() != 2)
+				{
+					return;
+				}
+
+				if (game::Com_GameMode_GetActiveGameMode() == game::GAME_MODE_SP)
+				{
+					command::execute(utils::string::va("spmap %s", args.get(1)));
+					return;
+				}
+
+				start_map(args.get(1), false);
+			});
+
+			if (!game::environment::is_dedi())
+			{
+				command::add("xpartystartvote", [](const command::params& args)
+				{
+					const auto vote_time = args.size() > 1 ? std::max(1, std::atoi(args.get(1))) : 15;
+					const auto lobby_time = args.size() > 2 ? std::atoi(args.get(2)) : vote_time;
+					const auto deadline = std::chrono::steady_clock::now() + 15s;
+
+					scheduler::schedule([=]()
+					{
+						if (party_host_start_map_vote(0, vote_time, lobby_time) != vote_result::not_ready)
+						{
+							return scheduler::cond_end;
+						}
+						return std::chrono::steady_clock::now() > deadline ? scheduler::cond_end : scheduler::cond_continue;
+					}, scheduler::pipeline::main, 100ms);
+				});
+
+				command::add("devmap", [](const command::params& args)
+				{
+					if (args.size() != 2)
+					{
+						return;
+					}
+
+					if (game::Com_GameMode_GetActiveGameMode() == game::GAME_MODE_SP)
+					{
+						command::execute(utils::string::va("spmap %s", args.get(1)));
+						return;
+					}
+
+					start_map(args.get(1), true);
+				});
+			}
+
+			command::add("map_restart", []()
+			{
+				if (!game::SV_Loaded() || game::Com_FrontEnd_IsInFrontEnd())
+				{
+					return;
+				}
+
+				if (game::Com_GameMode_GetActiveGameMode() == game::GAME_MODE_SP)
+				{
+					game::Cbuf_AddCall(0, game::SV_CmdsSP_MapRestart_f);
+					return;
+				}
+
+				game::SV_CmdsMP_RequestMapRestart(1, 0);
+			});
+
+			command::add("fast_restart", []()
+			{
+				if (!game::SV_Loaded() || game::Com_FrontEnd_IsInFrontEnd())
+				{
+					return;
+				}
+
+				if (game::Com_GameMode_GetActiveGameMode() == game::GAME_MODE_SP)
+				{
+					game::Cbuf_AddCall(0, game::SV_CmdsSP_FastRestart_f);
+					return;
+				}
+
+				game::SV_CmdsMP_RequestMapRestart(0, 0);
+			});
+
+			command::add("reconnect", [](const command::params& argument)
+			{
+				if (!server_connection_state.hostDefined)
+				{
+					console::info("Cannot connect to server.\n");
+					return;
+				}
+
+				if (game::CL_IsGameClientActive(0))
+				{
+					command::execute("disconnect");
+					command::execute("reconnect");
+				}
+				else
+				{
+					connect(server_connection_state.host);
+				}
+			});
+
+			command::add("connect", [](const command::params& argument)
+			{
+				if (argument.size() != 2)
+				{
+					return;
+				}
+
+				if (game::CL_IsGameClientActive(0))
+				{
+					console::info("Cannot use \"connect\" command while ingame.\n");
+					return;
+				}
+
+				game::netadr_s target{};
+				if (game::NET_StringToAdr(argument[1], &target))
+				{
+					connect(target);
+				}
+			});
+
+			command::add("kickClient", [](const command::params& params)
+			{
+				if (params.size() < 2)
+				{
+					console::info("usage: kickClient <num>, <reason>(optional)\n");
+					return;
+				}
+
+				if (!game::SV_Loaded() || game::Com_FrontEnd_IsInFrontEnd())
+				{
+					return;
+				}
+
+				std::string reason;
+				if (params.size() > 2)
+				{
+					reason = params.join(2);
+				}
+				if (reason.empty())
+				{
+					reason = "EXE_PLAYERKICKED";
+				}
+
+				const auto client_num = atoi(params.get(1));
+				if (client_num < 0 || static_cast<unsigned int>(client_num) >= *game::svs_numclients)
+				{
+					return;
+				}
+
+				party::g_memberInfo[client_num] = {};
+				party::g_memberInfoValid[client_num] = false;
+
+				scheduler::once([client_num, reason]()
+				{
+					game::SV_CmdsMP_KickClientNum(client_num, reason.data(), false);
+				}, scheduler::pipeline::server);
+			});
+
+			command::add("kick", [](const command::params& params)
+			{
+				if (params.size() < 2)
+				{
+					console::info("usage: kick <name>, <reason>(optional)\n");
+					return;
+				}
+
+				if (!game::SV_Loaded() || game::Com_FrontEnd_IsInFrontEnd())
+				{
+					return;
+				}
+
+				std::string reason;
+				if (params.size() > 2)
+				{
+					reason = params.join(2);
+				}
+				if (reason.empty())
+				{
+					reason = "EXE_PLAYERKICKED";
+				}
+
+				const std::string name = params.get(1);
+				if (name == "all"s)
+				{
+					for (auto i = 0u; i < *game::svs_numclients; ++i)
+					{
+						scheduler::once([i, reason]()
+						{
+							game::SV_CmdsMP_KickClientNum(i, reason.data(), false);
+						}, scheduler::pipeline::server);
+					}
+					return;
+				}
+
+				const auto client_num = get_client_num_by_name(name);
+				if (client_num < 0 || static_cast<unsigned int>(client_num) >= *game::svs_numclients)
+				{
+					return;
+				}
+
+				scheduler::once([client_num, reason]()
+				{
+					game::SV_CmdsMP_KickClientNum(client_num, reason.data(), false);
+				}, scheduler::pipeline::server);
+			});
+
+			scheduler::once([]()
+			{
+				sv_say_name = game::Dvar_RegisterString("sv_sayName", "console", game::DvarFlags::DVAR_FLAG_NONE, "Custom name for RCON console");
+			}, scheduler::pipeline::main);
+
+			command::add("tell", [](const command::params& params)
+			{
+				if (params.size() < 3)
+				{
+					return;
+				}
+
+				const auto client_num = atoi(params.get(1));
+				const auto message = params.join(2);
+				const auto* const name = sv_say_name->current.string;
+
+				game::SV_GameSendServerCommand(client_num, game::SV_CMD_CAN_IGNORE,
+				                               utils::string::va("%c \"%s: %s\"", 84, name, message.data()));
+				console::info("%s -> %i: %s\n", name, client_num, message.data());
+			});
+
+			command::add("tellraw", [](const command::params& params)
+			{
+				if (params.size() < 3)
+				{
+					return;
+				}
+
+				const auto client_num = atoi(params.get(1));
+				const auto message = params.join(2);
+
+				game::SV_GameSendServerCommand(client_num, game::SV_CMD_CAN_IGNORE,
+				                               utils::string::va("%c \"%s\"", 84, message.data()));
+				console::info("%i: %s\n", client_num, message.data());
+			});
+
+			command::add("say", [](const command::params& params)
+			{
+				if (params.size() < 2)
+				{
+					return;
+				}
+
+				const auto message = params.join(1);
+				const auto* const name = sv_say_name->current.string;
+
+				game::SV_GameSendServerCommand(
+					-1, game::SV_CMD_CAN_IGNORE, utils::string::va("%c \"%s: %s\"", 84, name, message.data()));
+				console::info("%s: %s\n", name, message.data());
+			});
+
+			command::add("sayraw", [](const command::params& params)
+			{
+				if (params.size() < 2)
+				{
+					return;
+				}
+
+				const auto message = params.join(1);
+
+				game::SV_GameSendServerCommand(-1, game::SV_CMD_CAN_IGNORE,
+				                               utils::string::va("%c \"%s\"", 84, message.data()));
+				console::info("%s\n", message.data());
+			});
+
+			network::on("getInfo", [](const game::netadr_s& target, const std::string_view& data)
+			{
+				utils::info_string info{};
+				info.set("challenge", std::string{ data });
+				info.set("gamename", "IW7");
+				info.set("hostname", get_dvar_string("sv_hostname"));
+				info.set("gametype", get_dvar_string("g_gametype"));
+				info.set("sv_motd", get_dvar_string("sv_motd"));
+				info.set("xuid", utils::string::va("%llX", steam::SteamUser()->GetSteamID().bits));
+				info.set("mapname", get_dvar_string("mapname"));
+				info.set("isPrivate", get_dvar_string("g_password").empty() ? "0" : "1");
+				info.set("clients", utils::string::va("%i", get_client_count()));
+				info.set("bots", utils::string::va("%i", get_bot_count()));
+				info.set("sv_maxclients", utils::string::va("%i", *game::svs_numclients));
+				info.set("protocol", utils::string::va("%i", PROTOCOL));
+				info.set("playmode", utils::string::va("%i", game::Com_GameMode_GetActiveGameMode()));
+				info.set("sv_running", utils::string::va("%i", get_dvar_bool("sv_running") && !game::Com_FrontEndScene_IsActive()));
+				info.set("dedicated", utils::string::va("%i", get_dvar_bool("dedicated")));
+				info.set("privatematch", utils::string::va("%i", get_dvar_bool("xblive_privatematch")));
+				info.set("sv_wwwBaseUrl", get_dvar_string("sv_wwwBaseUrl"));
+				info.set("sv_discordImageUrl", get_dvar_string("sv_discordImageUrl"));
+				info.set("sv_discordImageText", get_dvar_string("sv_discordImageText"));
+
+				const auto mapname = get_dvar_string("mapname");
+				if (!fastfiles::is_stock_map(mapname))
+				{
+					for (const auto& file : usermap_files)
+					{
+						const auto path = get_usermap_file_path(mapname, file);
+						const auto hash = get_file_hash(path);
+						info.set(file.name, hash);
+					}
+				}
+
+				const auto fs_game = get_dvar_string("fs_game");
+				info.set("fs_game", fs_game);
+
+				if (!fs_game.empty())
+				{
+					for (const auto& file : mod_files)
+					{
+						const auto hash = get_file_hash(utils::string::va("%s/mod%s",
+							fs_game.data(), file.extension.data()));
+						info.set(file.name, hash);
+					}
+				}
+
+				network::send(target, "infoResponse", info.build(), '\n');
+			});
+
+			network::on("clientinfo", [](const game::netadr_s& target, const std::string_view& data)
+			{
+				utils::info_string info{ data };
+				const std::string xuid = info.get("xuid");
+				const std::string name = info.get("gamertag");
+				const std::string clanTag = info.get("clanAbbrev");
+				const int clientNum = find_client_num_by_adr(target);
+				if (clientNum < 0 || !game::g_entities[clientNum].client || game::g_entities[clientNum].client->sess.connected == game::CON_DISCONNECTED)
+				{ 
+					if (clientNum >= 0)
+					{
+						party::g_memberInfo[clientNum] = {};
+						party::g_memberInfoValid[clientNum] = false;
+					}
+					console::debug("clientInfo: received from unknown client\n");
+					return; 
+				}
+
+				g_memberInfo[clientNum] = { xuid, name, clanTag };
+				g_memberInfoValid[clientNum] = true;
+
+				console::debug("clientInfo: %s (%s) [%s] on slot %d\n", name.c_str(), xuid.c_str(), clanTag.c_str(), clientNum); 
+
+				utils::info_string new_info{};
+				new_info.set("clientNum", std::to_string(clientNum));
+				new_info.set("xuid", xuid);
+				new_info.set("gamertag", name);
+				new_info.set("clanAbbrev", clanTag);
+
+				for (unsigned int i = 0; i < *game::svs_numclients; i++)
+				{
+					auto client = game::svs_clients[i];
+					if (client->header.state >= 1 && !game::SV_ClientIsBot(i) && !game::Session_IsHost(game::SV_MainMP_GetServerLobby(), i))
+					{
+						network::send(client->remoteAddress, "memberInfoUpdate", new_info.build(), '\n');
+					}
+				}
+
+				for (unsigned int i = 0; i < *game::svs_numclients; i++) 
+				{ 
+					if (!g_memberInfoValid[i]) continue; 
+					utils::info_string snapshot{}; 
+					snapshot.set("clientNum", std::to_string(i));
+					snapshot.set("xuid", g_memberInfo[i].xuid); 
+					snapshot.set("gamertag", g_memberInfo[i].name); 
+					snapshot.set("clanAbbrev", g_memberInfo[i].clanTag); 
+					network::send(target, "memberInfoUpdate", snapshot.build(), '\n');
+				}
+			});
+
+			if (game::environment::is_dedi())
+			{
+				return;
+			}
+
+			network::on("memberInfoUpdate", [](const game::netadr_s&, const std::string_view& data)
+			{
+				utils::info_string info{ data }; 
+
+				int clientNum = std::stoi(info.get("clientNum"));
+				if (clientNum < 0 || clientNum >= 18) 
+					return;
+
+				g_clientMemberInfo[clientNum] = 
+				{ 
+					info.get("xuid"), 
+					info.get("gamertag"),
+					info.get("clanAbbrev") 
+				};
+
+				g_clientMemberInfoValid[clientNum] = true;
+
+				console::debug("Stored memberInfo for client %d: %s [%s]\n", clientNum, g_clientMemberInfo[clientNum].name.c_str(), g_clientMemberInfo[clientNum].clanTag.c_str());
+			});
+
+			network::on("infoResponse", [](const game::netadr_s& target, const std::string_view& data)
+			{
+				const utils::info_string info{ data };
+				server_list::handle_info_response(target, info);
+
+				if (server_connection_state.host != target)
+				{
+					return;
+				}
+
+				const auto protocol = info.get("protocol");
+				if (std::atoi(protocol.data()) != PROTOCOL)
+				{
+					info_response_error("Connection failed: Invalid protocol.");
+					return;
+				}
+
+				if (info.get("challenge") != server_connection_state.challenge)
+				{
+					info_response_error("Connection failed: Invalid challenge.");
+					return;
+				}
+
+				const auto gamename = info.get("gamename");
+				if (gamename != "IW7"s)
+				{
+					info_response_error("Connection failed: Invalid gamename.");
+					return;
+				}
+
+				const auto playmode = info.get("playmode");
+				if (game::GameModeType(std::atoi(playmode.data())) != game::Com_GameMode_GetActiveGameMode())
+				{
+					info_response_error("Connection failed: Invalid playmode.");
+					return;
+				}
+
+				const auto sv_running = info.get("sv_running");
+				if (!std::atoi(sv_running.data()))
+				{
+					info_response_error("Connection failed: Server not running.");
+					return;
+				}
+
+				const auto mapname = info.get("mapname");
+				if (mapname.empty())
+				{
+					info_response_error("Connection failed: Invalid map.");
+					return;
+				}
+
+				const auto gametype = info.get("gametype");
+				if (gametype.empty())
+				{
+					info_response_error("Connection failed: Invalid gametype.");
+					return;
+				}
+
+				const auto sv_maxclients_str = info.get("sv_maxclients");
+				const auto sv_maxclients = std::atoi(sv_maxclients_str.data());
+				if (!sv_maxclients)
+				{
+					info_response_error("Connection failed: Invalid sv_maxclients.");
+					return;
+				}
+
+				server_connection_state.base_url = info.get("sv_wwwBaseUrl");
+
+				if (download_files(target, info, true))
+				{
+					return;
+				}
+
+				server_connection_state.motd = info.get("sv_motd");
+				server_connection_state.max_clients = std::stoi(sv_maxclients_str);
+				server_connection_state.hostname = info.get("hostname");
+
+				const auto profile_info = profile_infos::get_profile_info();
+				if (!profile_info.has_value())
+				{
+					console::error("profile_info has no value to send, possible undefined behavior ahead\n");
+				}
+
+				const auto profile_info_value = profile_info.value_or(profile_infos::profile_info{});
+				profile_infos::send_profile_info(target, steam::SteamUser()->GetSteamID().bits, profile_info_value);
+
+				discord_information discord_info{};
+				discord_info.image = info.get("sv_discordImageUrl");
+				discord_info.image_text = info.get("sv_discordImageText");
+				if (!discord_info.image.empty() || !discord_info.image_text.empty())
+				{
+					server_discord_info.emplace(discord_info);
+				}
+
+				const auto privatematch = std::atoi(info.get("privatematch").data());
+
+				connect_to_party(target, mapname, gametype, sv_maxclients, privatematch);
+			});
+		}
+	};
+}
+
+REGISTER_COMPONENT(party::component)

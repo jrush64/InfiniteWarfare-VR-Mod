@@ -1,0 +1,780 @@
+#include <std_include.hpp>
+#include "../dw_include.hpp"
+
+#include "game/game.hpp"
+
+#include "utils/io.hpp"
+#include "utils/json.hpp"
+
+namespace demonware
+{
+	namespace loot
+	{
+		const std::string& json_data_path = "iw7-mod/players2/user/loot/loot.json";
+		nlohmann::json json_buffer;
+
+		namespace csv
+		{
+			struct LootCsv
+			{
+				std::string file;
+				std::uint32_t index;
+				std::uint32_t quality;
+				std::uint32_t salvageReturned;
+				std::uint32_t cost;
+			};
+
+			struct LootCrateCsv
+			{
+				std::string file;
+				std::uint32_t index;
+				std::uint32_t cost;
+				std::uint32_t premiumCost;
+				std::uint32_t CODPointsSKU;
+			};
+
+			LootCsv weapon
+			{
+				.file = "mp/loot/iw7_weapon_loot_master.csv",
+				.index = 0,
+				.quality = 6,
+				.salvageReturned = 3,
+				.cost = 4,
+			};
+
+			LootCsv killstreak
+			{
+				.file = "mp/loot/iw7_killstreak_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 3,
+				.cost = 4,
+			};
+
+			LootCsv consumable
+			{
+				.file = "mp/loot/iw7_consumable_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_attachments
+			{
+				.file = "mp/loot/iw7_cosmetic_attachments_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_calling_cards
+			{
+				.file = "mp/loot/iw7_cosmetic_calling_cards_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_camos
+			{
+				.file = "mp/loot/iw7_cosmetic_camos_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_emblems
+			{
+				.file = "mp/loot/iw7_cosmetic_emblems_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_emotes
+			{
+				.file = "mp/loot/iw7_cosmetic_emotes_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_heroes
+			{
+				.file = "mp/loot/iw7_cosmetic_heroes_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_reticles
+			{
+				.file = "mp/loot/iw7_cosmetic_reticles_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv cosmetic_rigs
+			{
+				.file = "mp/loot/iw7_cosmetic_rigs_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 4,
+				.cost = 5,
+			};
+
+			LootCsv zombiefatefortune
+			{
+				.file = "cp/loot/iw7_zombiefatefortune_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 0xFF,
+				.cost = 0xFF,
+			};
+
+			LootCsv zombiecards
+			{
+				.file = "cp/loot/iw7_zombiecards_loot_master.csv",
+				.index = 0,
+				.quality = 2,
+				.salvageReturned = 0xFF,
+				.cost = 0xFF,
+			};
+
+			LootCrateCsv loot_crate
+			{
+				.file = "mp/loot/iw7_loot_crate_loot_master.csv",
+				.index = 0,
+				.cost = 3,
+				.premiumCost = 4,
+				.CODPointsSKU = 5,
+			};
+		}
+
+		std::vector<std::uint32_t> lootmap_weapon;
+		std::vector<std::uint32_t> lootmap_killstreak;
+		std::vector<std::uint32_t> lootmap_consumable;
+		std::vector<std::uint32_t> lootmap_cosmetic_attachments;
+		std::vector<std::uint32_t> lootmap_cosmetic_calling_cards;
+		std::vector<std::uint32_t> lootmap_cosmetic_camos;
+		std::vector<std::uint32_t> lootmap_cosmetic_emblems;
+		std::vector<std::uint32_t> lootmap_cosmetic_emotes;
+		std::vector<std::uint32_t> lootmap_cosmetic_heroes;
+		std::vector<std::uint32_t> lootmap_cosmetic_reticles;
+		std::vector<std::uint32_t> lootmap_cosmetic_rigs;
+		std::vector<std::uint32_t> lootmap_zombiefatefortune;
+		std::vector<std::uint32_t> lootmap_zombiecards;
+
+		std::unordered_map<std::uint32_t, Item> m_lootmap;
+
+		struct LootCrate
+		{
+			std::uint32_t cost;
+			std::uint32_t premiumCost;
+			std::uint32_t salvageCost;
+		};
+
+		std::unordered_map<std::uint32_t, LootCrate> lootcrates;
+
+		std::unordered_map<std::uint32_t, std::uint32_t> hero_rig_pieces;
+
+		void read_loot_csv(csv::LootCsv& csv, std::vector<std::uint32_t>& lootmap, bool should_ignore = true)
+		{
+			lootmap.clear();
+
+			const auto asset = game::DB_FindXAssetHeader(game::ASSET_TYPE_STRINGTABLE, csv.file.data(), 0).stringTable;
+			if (!asset)
+			{
+				return;
+			}
+
+			for (auto row = 0; row < asset->rowCount; row++)
+			{
+				const std::uint32_t id = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv.index));
+				const std::uint32_t quality = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv.quality));
+
+				std::uint32_t salvageReturned = 0;
+				std::uint32_t cost = 0;
+
+				if (csv.salvageReturned != 0xFF)
+				{
+					salvageReturned = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv.salvageReturned));
+				}
+
+				if (csv.cost != 0xFF)
+				{
+					cost = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv.cost));
+				}
+
+				// reward item, not from lootboxes
+				if (should_ignore && cost == 0 && salvageReturned == 0)
+					continue;
+
+				const Item loot = { id, quality, salvageReturned, cost };
+				m_lootmap[id] = loot;
+				lootmap.push_back(id);
+			}
+		}
+
+		void read_weapon_csv()
+		{
+			read_loot_csv(csv::weapon, lootmap_weapon);
+		}
+
+		void read_killstreak_csv()
+		{
+			read_loot_csv(csv::killstreak, lootmap_killstreak);
+		}
+
+		void read_consumable_csv()
+		{
+			read_loot_csv(csv::consumable, lootmap_consumable);
+		}
+
+		void read_cosmetic_attachments_csv()
+		{
+			read_loot_csv(csv::cosmetic_attachments, lootmap_cosmetic_attachments);
+		}
+
+		void read_cosmetic_calling_cards_csv()
+		{
+			read_loot_csv(csv::cosmetic_calling_cards, lootmap_cosmetic_calling_cards);
+		}
+
+		void read_cosmetic_camos_csv()
+		{
+			read_loot_csv(csv::cosmetic_camos, lootmap_cosmetic_camos);
+		}
+
+		void read_cosmetic_emblems_csv()
+		{
+			read_loot_csv(csv::cosmetic_emblems, lootmap_cosmetic_emblems);
+		}
+
+		void read_cosmetic_emotes_csv()
+		{
+			read_loot_csv(csv::cosmetic_emotes, lootmap_cosmetic_emotes);
+		}
+
+		void read_cosmetic_heroes_csv()
+		{
+			read_loot_csv(csv::cosmetic_heroes, lootmap_cosmetic_heroes);
+		}
+
+		void read_cosmetic_reticles_csv()
+		{
+			read_loot_csv(csv::cosmetic_reticles, lootmap_cosmetic_reticles);
+		}
+
+		void read_cosmetic_rigs_csv()
+		{
+			read_loot_csv(csv::cosmetic_rigs, lootmap_cosmetic_rigs);
+		}
+
+		void read_hero_rig_pieces()
+		{
+			hero_rig_pieces.clear();
+
+			const auto heroes = game::DB_FindXAssetHeader(game::ASSET_TYPE_STRINGTABLE, csv::cosmetic_heroes.file.data(), 0).stringTable;
+			const auto rigs = game::DB_FindXAssetHeader(game::ASSET_TYPE_STRINGTABLE, csv::cosmetic_rigs.file.data(), 0).stringTable;
+			if (!heroes || !rigs)
+			{
+				return;
+			}
+
+			// heroes: col 13 head, col 14 body
+			std::unordered_map<std::string, std::uint32_t> hero_refs;
+			for (auto row = 0; row < heroes->rowCount; row++)
+			{
+				const std::uint32_t id = std::atoi(game::StringTable_GetColumnValueForRow(heroes, row, csv::cosmetic_heroes.index));
+				for (const auto column : { 13, 14 })
+				{
+					const std::string ref = game::StringTable_GetColumnValueForRow(heroes, row, column);
+					if (!ref.empty())
+					{
+						hero_refs[ref] = id;
+					}
+				}
+			}
+
+			// rigs: col 1 ref
+			for (auto row = 0; row < rigs->rowCount; row++)
+			{
+				const std::string ref = game::StringTable_GetColumnValueForRow(rigs, row, 1);
+				if (const auto hero = hero_refs.find(ref); hero != hero_refs.end())
+				{
+					const std::uint32_t id = std::atoi(game::StringTable_GetColumnValueForRow(rigs, row, csv::cosmetic_rigs.index));
+					hero_rig_pieces[id] = hero->second;
+				}
+			}
+
+			std::erase_if(lootmap_cosmetic_rigs, [](const std::uint32_t id)
+			{
+				return hero_rig_pieces.contains(id);
+			});
+		}
+
+		void read_zombiefatefortune_csv()
+		{
+			read_loot_csv(csv::zombiefatefortune, lootmap_zombiefatefortune, false);
+		}
+
+		void read_zombiecards_csv()
+		{
+			read_loot_csv(csv::zombiecards, lootmap_zombiecards, false);
+		}
+
+		void read_loot_crate_csv()
+		{
+			lootcrates.clear();
+
+			const auto asset = game::DB_FindXAssetHeader(game::ASSET_TYPE_STRINGTABLE, csv::loot_crate.file.data(), 0).stringTable;
+			if (!asset) return;
+
+			for (auto row = 0; row < asset->rowCount; row++)
+			{
+				const std::uint32_t id = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv::loot_crate.index));
+				const std::uint32_t cost = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv::loot_crate.cost));
+				const std::uint32_t premiumCost = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv::loot_crate.premiumCost));
+				const std::uint32_t CODPointsSKU = std::atoi(game::StringTable_GetColumnValueForRow(asset, row, csv::loot_crate.CODPointsSKU));
+				lootcrates[id] = { cost, premiumCost, CODPointsSKU };
+			}
+		}
+
+		void cache_loot()
+		{
+			static bool once = false;
+			if (once) return;
+			once = true;
+
+			m_lootmap.clear();
+
+			// mp
+			read_weapon_csv();
+			read_killstreak_csv();
+			read_consumable_csv();
+			read_cosmetic_attachments_csv();
+			read_cosmetic_calling_cards_csv();
+			read_cosmetic_camos_csv();
+			read_cosmetic_emblems_csv();
+			read_cosmetic_emotes_csv();
+			read_cosmetic_heroes_csv();
+			read_cosmetic_reticles_csv();
+			read_cosmetic_rigs_csv();
+			read_hero_rig_pieces();
+
+			// cp
+			read_zombiefatefortune_csv();
+			read_zombiecards_csv();
+
+			// crates
+			read_loot_crate_csv();
+		}
+
+		std::vector<Item> get_random_loot_from_map(std::vector<std::uint32_t>& lootmap, const size_t itemAmount, const float luckFactor, std::uint32_t quaranteedQuality = 0)
+		{
+			std::vector<Item> selectedItems;
+
+			if (lootmap.empty())
+			{
+				console::error("get_random_loot_from_map: Lootmap is empty");
+				return selectedItems;
+			}
+
+			if (itemAmount > lootmap.size())
+			{
+				console::error("get_random_loot_from_map: Item amount exceeds the number of available items");
+				return selectedItems;
+			}
+
+			if (luckFactor <= 0)
+			{
+				console::error("get_random_loot_from_map: Luck factor must be greater than zero");
+				return selectedItems;
+			}
+
+			double totalWeight = 0;
+			std::vector<double> adjustedWeights(lootmap.size());
+
+			for (size_t i = 0; i < lootmap.size(); ++i)
+			{
+				if (!get_loot(lootmap[i]).quality)
+				{
+					continue;
+				}
+
+				adjustedWeights[i] = 1.0 / std::pow(get_loot(lootmap[i]).quality, luckFactor);
+				totalWeight += adjustedWeights[i];
+			}
+
+			assert(adjustedWeights.size() >= itemAmount);
+
+			std::random_device rd;
+			std::mt19937 gen(rd());
+			std::uniform_real_distribution<> dis(0.0, totalWeight);
+
+			while (selectedItems.size() < itemAmount)
+			{
+				double randomValue = dis(gen);
+				double cumulativeWeight = 0;
+
+				for (size_t i = 0; i < lootmap.size(); ++i) 
+				{
+					cumulativeWeight += adjustedWeights[i];
+					if (randomValue < cumulativeWeight) 
+					{
+						if (quaranteedQuality && get_loot(lootmap[i]).quality < quaranteedQuality)
+							continue;
+						else
+							quaranteedQuality = 0;
+
+						if (std::find(selectedItems.begin(), selectedItems.end(), get_loot(lootmap[i])) == selectedItems.end()) {
+							selectedItems.push_back(get_loot(lootmap[i]));
+							break;
+						}
+					}
+				}
+			}
+
+			return selectedItems;
+		}
+
+		std::vector<std::uint32_t> combined_mp_lootmaps;
+		std::vector<std::uint32_t> combine_mp_lootmaps()
+		{
+			std::vector<std::uint32_t>& lootmap = combined_mp_lootmaps;
+			if (!combined_mp_lootmaps.empty())
+			{
+				return combined_mp_lootmaps;
+			}
+
+			lootmap.insert(lootmap.end(), lootmap_weapon.begin(), lootmap_weapon.end());
+			lootmap.insert(lootmap.end(), lootmap_killstreak.begin(), lootmap_killstreak.end());
+			lootmap.insert(lootmap.end(), lootmap_consumable.begin(), lootmap_consumable.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_attachments.begin(), lootmap_cosmetic_attachments.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_calling_cards.begin(), lootmap_cosmetic_calling_cards.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_camos.begin(), lootmap_cosmetic_camos.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_emblems.begin(), lootmap_cosmetic_emblems.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_emotes.begin(), lootmap_cosmetic_emotes.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_heroes.begin(), lootmap_cosmetic_heroes.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_reticles.begin(), lootmap_cosmetic_reticles.end());
+			lootmap.insert(lootmap.end(), lootmap_cosmetic_rigs.begin(), lootmap_cosmetic_rigs.end());
+			return lootmap;
+		}
+
+		std::vector<std::uint32_t> get_all_lootmaps()
+		{
+			cache_loot();
+
+			std::vector<std::uint32_t> lootmap = combine_mp_lootmaps();
+			lootmap.insert(lootmap.end(), lootmap_zombiefatefortune.begin(), lootmap_zombiefatefortune.end());
+			return lootmap;
+		}
+
+		std::vector<Item> all_loot;
+		std::vector<Item> get_all_loot()
+		{
+			if (!all_loot.empty())
+			{
+				return all_loot;
+			}
+
+			std::vector<Item>& items = all_loot;
+			auto lootmap = get_all_lootmaps();
+			for (size_t i = 0; i < lootmap.size(); i++)
+			{
+				items.push_back(get_loot(lootmap[i]));
+			}
+
+			return items;
+		};
+
+		void read_json_data();
+
+		bool is_hero_rig_piece(const std::uint32_t item_id)
+		{
+			cache_loot();
+			return hero_rig_pieces.contains(item_id);
+		}
+
+		void grant_heroes_for_owned_rig_pieces()
+		{
+			auto& loot = json_buffer["Loot"];
+
+			auto changed = false;
+			for (const auto& [piece, hero] : hero_rig_pieces)
+			{
+				if (!loot.contains(std::to_string(piece)) || !get_item_balance(piece))
+				{
+					continue;
+				}
+
+				if (loot.contains(std::to_string(hero)) && get_item_balance(hero))
+				{
+					continue;
+				}
+
+				set_item_balance(hero, 1);
+				changed = true;
+			}
+
+			if (changed)
+			{
+				save();
+			}
+		}
+
+		std::vector<Item> get_all_loot_owned()
+		{
+			cache_loot();
+			read_json_data();
+			grant_heroes_for_owned_rig_pieces();
+
+			std::vector<Item> items{};
+			for (const auto& entry : json_buffer["Loot"].items())
+			{
+				const auto id = static_cast<std::uint32_t>(std::strtoul(entry.key().data(), nullptr, 10));
+				if (!id || !get_item_balance(id))
+				{
+					continue;
+				}
+
+				auto item = get_loot(id);
+				item.id = id;
+				items.push_back(item);
+			}
+
+			return items;
+		}
+
+		Item get_loot(const std::uint32_t item_id)
+		{
+			if (m_lootmap.contains(item_id))
+			{
+				return m_lootmap[item_id];
+			}
+
+			return {};
+		}
+
+		std::vector<Item> get_random_loot_CommonCrate(const float scale = 1.0f, std::uint32_t quality = 0)
+		{
+			std::vector<std::uint32_t> lootmap = combine_mp_lootmaps();
+
+			return get_random_loot_from_map(lootmap, 3, scale, quality);
+		}
+
+		std::vector<Item> get_random_loot_RareCrate()
+		{
+			return get_random_loot_CommonCrate(0.34f, 2);
+		}
+
+		std::vector<Item> get_random_loot_ZombieCrate(const float scale = 1.0f, std::uint32_t quality = 0)
+		{
+			std::vector<std::uint32_t> lootmap = combine_mp_lootmaps();
+			size_t cards = quality == 2 ? 3 : 1;
+
+			auto mp = get_random_loot_from_map(lootmap, 2, scale, quality);
+			auto cp = get_random_loot_from_map(lootmap_zombiefatefortune, cards, scale);
+
+			std::vector<Item> items;
+			items.push_back(mp[0]);
+			items.push_back(mp[1]);
+
+			for (size_t i = 0; i < cards; ++i)
+			{
+				items.push_back(cp[i]);
+			}
+
+			return items;
+		}
+
+		std::vector<Item> get_random_loot_ZombieRareCrate()
+		{
+			return get_random_loot_ZombieCrate(0.34f, 2);
+		}
+
+		std::vector<Item> get_random_loot_ZombieCardPack(const float scale = 1.0f, std::uint32_t quality = 0)
+		{
+			return get_random_loot_from_map(lootmap_zombiefatefortune, 3, scale, quality);
+		}
+
+		std::vector<Item> get_random_loot_ZombieRareCardPack()
+		{
+			return get_random_loot_ZombieCardPack(0.34f, 2);
+		}
+
+		std::vector<Item> get_random_loot(const std::uint32_t lootbox_id)
+		{
+			cache_loot();
+
+			switch (lootbox_id)
+			{
+			case LootBoxType::LOOT_COMMON_CRATE:
+				return get_random_loot_CommonCrate();
+			case LootBoxType::LOOT_RARE_CRATE:
+				return get_random_loot_RareCrate();
+			case LootBoxType::ZOMBIE_COMMON_CRATE:
+				return get_random_loot_ZombieCrate();
+			case LootBoxType::ZOMBIE_RARE_CRATE:
+				return get_random_loot_ZombieRareCrate();
+			case LootBoxType::ZOMBIE_COMMON_CARD_PACK:
+				return get_random_loot_ZombieCardPack();
+			case LootBoxType::ZOMBIE_RARE_CARD_PACK:
+				return get_random_loot_ZombieRareCardPack();
+			default:
+				return {};
+			}
+		}
+
+		std::uint32_t get_lootcrate_cost(const std::uint32_t id, const std::uint32_t type)
+		{
+			if (lootcrates.contains(id))
+			{
+				switch(type)
+				{
+				case CurrencyType::keys:
+					return lootcrates[id].cost;
+					break;
+				case CurrencyType::codpoints:
+					return lootcrates[id].premiumCost;
+					break;
+				case CurrencyType::salvage:
+					return lootcrates[id].salvageCost;
+					break;
+				}
+			}
+
+			return 0;
+		}
+
+		template <typename T> void json_put(nlohmann::json& field, T value)
+		{
+			field = value;
+		}
+
+		template <typename T> T json_read(nlohmann::json& field)
+		{
+			if (!field.is_null())
+			{
+				return field.get<T>();
+			}
+			else
+			{
+				return T{};
+			}
+		}
+
+		void save_json_data()
+		{
+			auto dump = json_buffer.dump(4);
+			utils::io::write_file(json_data_path, dump);
+		}
+
+		void read_json_data()
+		{
+			if (!json_buffer.empty())
+			{
+				return;
+			}
+
+			if (utils::io::file_exists(json_data_path))
+			{
+				auto data = utils::io::read_file(json_data_path);
+				json_buffer = nlohmann::json::parse(data);
+				return;
+			}
+
+			json_buffer = {};
+
+			set_currency_balance(CurrencyType::keys, 0);
+			set_currency_balance(CurrencyType::salvage, 0);
+			set_currency_balance(CurrencyType::codpoints, 0);
+
+			json_put(json_buffer["DailyLogin"]["DaysLoggedIn"], 0);
+			json_put(json_buffer["DailyLogin"]["LastDateClaimed"], -1);
+
+			save_json_data();
+		}
+
+		void set_item_balance(const std::uint32_t item_id, const std::uint32_t amount)
+		{
+			json_put(json_buffer["Loot"][std::to_string(item_id)]["Balance"], amount);
+		}
+
+		std::uint32_t get_item_balance(const std::uint32_t item_id)
+		{
+			read_json_data();
+			return json_read<std::uint32_t>(json_buffer["Loot"][std::to_string(item_id)]["Balance"]);
+		}
+
+		void set_currency_balance(const std::uint32_t currency_id, const std::uint32_t amount)
+		{
+			json_put(json_buffer["Currency"][std::to_string(currency_id)]["Balance"], amount);
+		}
+
+		std::uint32_t get_currency_balance(const std::uint32_t currency_id)
+		{
+			read_json_data();
+			return json_read<std::uint32_t>(json_buffer["Currency"][std::to_string(currency_id)]["Balance"]);
+		}
+
+		// daily login
+		bool is_new_day()
+		{
+			read_json_data();
+
+			const int64_t last_date_claimed = json_read<int64_t>(json_buffer["DailyLogin"]["LastDateClaimed"]);
+			if (last_date_claimed == -1)
+				return true;
+
+			std::time_t now_time = std::time(nullptr);
+			std::time_t last_time = static_cast<std::time_t>(last_date_claimed);
+
+			std::tm now_tm{};
+			std::tm last_tm{};
+
+#if defined(_WIN32)
+			localtime_s(&now_tm, &now_time);
+			localtime_s(&last_tm, &last_time);
+#else
+			localtime_r(&now_time, &now_tm);
+			localtime_r(&last_time, &last_tm);
+#endif
+
+			return (now_tm.tm_year != last_tm.tm_year) ||
+				(now_tm.tm_yday != last_tm.tm_yday);
+		}
+
+		int get_days_logged_in()
+		{
+			read_json_data();
+			return json_read<int>(json_buffer["DailyLogin"]["DaysLoggedIn"]);
+		}
+
+		void set_days_logged_in(const std::int32_t new_days)
+		{
+			const int64_t now =
+				std::chrono::duration_cast<std::chrono::seconds>(
+					std::chrono::system_clock::now().time_since_epoch()
+				).count();
+
+			json_put(json_buffer["DailyLogin"]["DaysLoggedIn"], new_days);
+			json_put(json_buffer["DailyLogin"]["LastDateClaimed"], now);
+		}
+
+		void save()
+		{
+			save_json_data();
+		}
+	}
+}

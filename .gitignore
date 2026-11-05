@@ -1,0 +1,12 @@
+.vs
+.vscode
+build/
+
+# VR fork: runtime output and stray build by-products
+*.log
+*.obj
+*.pdb
+*.ilk
+*.exp
+Thumbs.db
+desktop.ini

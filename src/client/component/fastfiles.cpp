@@ -1,0 +1,799 @@
+#include <std_include.hpp>
+#include "loader/component_loader.hpp"
+#include "fastfiles.hpp"
+
+#include "game/game.hpp"
+
+#include "command.hpp"
+#include "console/console.hpp"
+
+#include "filesystem.hpp"
+
+#include <utils/hook.hpp>
+#include <utils/string.hpp>
+#include <utils/concurrency.hpp>
+#include <utils/io.hpp>
+
+//#define XFILE_DEBUG
+
+namespace fastfiles
+{
+	static utils::concurrency::container<std::string> current_fastfile;
+	static utils::concurrency::container<std::optional<std::string>> current_usermap;
+
+	std::string get_current_fastfile()
+	{
+		std::string fastfile_copy;
+		current_fastfile.access([&](std::string& fastfile)
+		{
+			fastfile_copy = fastfile;
+		});
+		return fastfile_copy;
+	}
+
+	namespace
+	{
+		utils::hook::detour db_try_load_x_file_internal_hook;
+		utils::hook::detour db_init_load_x_file_hook;
+		utils::hook::detour db_load_x_zone_hook;
+		utils::hook::detour db_find_xasset_header_hook;
+		utils::hook::detour db_add_xasset_hook;
+		utils::hook::detour sys_createfile_hook;
+
+		void db_try_load_x_file_internal_stub(const char* zone_name, const unsigned int zone_flags,
+			const bool is_base_map, const bool was_paused, const int failure_mode)
+		{
+			current_fastfile.access([&](std::string& fastfile)
+			{
+				fastfile = zone_name;
+			});
+			return db_try_load_x_file_internal_hook.invoke<void>(zone_name, zone_flags, is_base_map, was_paused, failure_mode);
+		}
+
+		void db_init_load_x_file_stub(const char* name, std::uint64_t offset)
+		{
+			console::info("Loading xfile %s\n", name);
+			return db_init_load_x_file_hook.invoke<void>(name, offset);
+		}
+
+		void db_load_x_zone_stub(const char* parent_name, const unsigned int zone_flags, const bool is_base_map, const int failure_mode)
+		{
+			console::info("Loading zone %s\n", parent_name);
+			return db_load_x_zone_hook.invoke<void>(parent_name, zone_flags, is_base_map, failure_mode);
+		}
+
+		game::dvar_t* g_dump_scripts;
+		void dump_gsc_script(const std::string& name, game::XAssetHeader header)
+		{
+			if (!g_dump_scripts->current.enabled)
+			{
+				return;
+			}
+
+			std::string buffer;
+			buffer.append(header.scriptfile->name, strlen(header.scriptfile->name) + 1);
+			buffer.append(reinterpret_cast<char*>(&header.scriptfile->compressedLen), 4);
+			buffer.append(reinterpret_cast<char*>(&header.scriptfile->len), 4);
+			buffer.append(reinterpret_cast<char*>(&header.scriptfile->bytecodeLen), 4);
+			buffer.append(header.scriptfile->buffer, header.scriptfile->compressedLen);
+			buffer.append(header.scriptfile->bytecode, header.scriptfile->bytecodeLen);
+
+			const auto out_name = utils::string::va("gsc_dump/%s.gscbin", name.data());
+			utils::io::write_file(out_name, buffer);
+
+			console::info("Dumped %s\n", out_name);
+		}
+
+		game::XAssetHeader db_find_xasset_header_stub(game::XAssetType type, const char* name, const int allow_create_default)
+		{
+			auto result = db_find_xasset_header_hook.invoke<game::XAssetHeader>(type, name, allow_create_default);
+			if (!result.data && type != game::ASSET_TYPE_LOCALIZE_ENTRY)
+			{
+				console::error("Error: Could not find %s \"%s\"\n",
+					game::g_assetNames[static_cast<unsigned int>(type)],
+					name);
+			}
+			
+			return result;
+		}
+
+		game::XAssetHeader db_add_xasset_stub(game::XAssetType type, game::XAssetHeader* header_ptr)
+		{
+			auto header = *header_ptr;
+			
+			if (type == game::ASSET_TYPE_SCRIPTFILE && header.scriptfile)
+			{
+				dump_gsc_script(header.scriptfile->name ? header.scriptfile->name : "__unnamed__", header);
+			}
+
+			auto result = db_add_xasset_hook.invoke<game::XAssetHeader>(type, header_ptr);
+			return result;
+		}
+
+		HANDLE create_file_a(const std::string& filepath)
+		{
+			return CreateFileA(filepath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+				FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
+		}
+
+		HANDLE find_usermap_art(const std::string& filename)
+		{
+			if (!filename.ends_with("_art.ff"))
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			const auto mapname = filename.substr(0, filename.size() - std::strlen("_art.ff"));
+			const auto path = utils::string::va("usermaps\\%s\\%s", mapname.data(), filename.data());
+			if (!utils::io::file_exists(path))
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			return create_file_a(path);
+		}
+
+		HANDLE find_usermap_localized(const std::string& filename)
+		{
+			if (!filename.ends_with(".ff"))
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			const auto zone = filename.substr(0, filename.size() - std::strlen(".ff"));
+			const auto prefix = zone.find('_');
+			if (prefix == std::string::npos || !game::DB_IsLocalized(zone.data()))
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			const auto mapname = zone.substr(prefix + 1);
+			const auto path = utils::string::va("usermaps\\%s\\%s", mapname.data(), filename.data());
+			if (mapname.empty() || !utils::io::file_exists(path))
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			return create_file_a(path);
+		}
+
+		HANDLE find_usermap(const std::string& filename)
+		{
+			const auto art = find_usermap_art(filename);
+			if (art != INVALID_HANDLE_VALUE)
+			{
+				return art;
+			}
+
+			const auto localized = find_usermap_localized(filename);
+			if (localized != INVALID_HANDLE_VALUE)
+			{
+				return localized;
+			}
+
+			const auto ext = filename.find_last_of('.');
+			if (ext == std::string::npos)
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			auto usermap_value = filename.substr(0, ext);
+			if (usermap_value.ends_with("_load"))
+			{
+				usermap_value.resize(usermap_value.size() - std::strlen("_load"));
+			}
+
+			if (usermap_value.empty() ||
+				!utils::io::file_exists(utils::string::va("usermaps\\%s\\%s.ff", usermap_value.data(), usermap_value.data())))
+			{
+				return INVALID_HANDLE_VALUE;
+			}
+
+			const std::string usermap_file = utils::string::va("%s.ff", usermap_value.data());
+			const std::string usermap_load_file = utils::string::va("%s_load.ff", usermap_value.data());
+			const std::string usermap_pak_file = utils::string::va("%s.pak", usermap_value.data());
+			const std::string usermap_sabl_file = utils::string::va("%s.sabl", usermap_value.data());
+			const std::string usermap_sabs_file = utils::string::va("%s.sabs", usermap_value.data());
+
+			if (filename == usermap_file || filename == usermap_load_file || filename == usermap_pak_file ||
+				filename == usermap_sabl_file || filename == usermap_sabs_file)
+			{
+				const auto path = utils::string::va("usermaps\\%s\\%s", usermap_value.data(), filename.data());
+				if (utils::io::file_exists(path))
+				{
+					return create_file_a(path);
+				}
+			}
+
+			return INVALID_HANDLE_VALUE;
+		}
+
+		HANDLE sys_create_file(game::Sys_Folder folder, const char* base_filename, bool ignore_usermap)
+		{
+			auto result = sys_createfile_hook.invoke<HANDLE>(folder, base_filename);
+
+			if (base_filename == "mod.ff"s || base_filename == "mod.sabs"s || base_filename == "mod.sabl"s)
+			{
+				auto* fs_basepath = game::Dvar_FindVar("fs_basepath");
+				auto* fs_game = game::Dvar_FindVar("fs_game");
+
+				std::string dir = fs_basepath ? fs_basepath->current.string : "";
+				std::string mod_dir = fs_game ? fs_game->current.string : "";
+
+				if (!mod_dir.empty())
+				{
+					const auto path = utils::string::va("%s\\%s\\%s", dir.data(), mod_dir.data(), base_filename);
+					if (utils::io::file_exists(path))
+					{
+						return create_file_a(path);
+					}
+				}
+				return INVALID_HANDLE_VALUE;
+			}
+
+			if (result != INVALID_HANDLE_VALUE)
+			{
+				return result;
+			}
+
+			if (!ignore_usermap)
+			{
+				const auto usermap = find_usermap(base_filename);
+				if (usermap != INVALID_HANDLE_VALUE)
+				{
+					return usermap;
+				}
+			}
+
+			std::string real_path{};
+			if (filesystem::find_file("zone\\"s + base_filename, &real_path))
+			{
+				return create_file_a(real_path.data());
+			}
+
+			return INVALID_HANDLE_VALUE;
+		}
+
+		HANDLE sys_create_file_stub(game::Sys_Folder folder, const char* base_filename)
+		{
+			return sys_create_file(folder, base_filename, false);
+		}
+
+		utils::hook::detour db_file_exists_hook;
+		bool db_file_exists_stub(const char* file)
+		{
+			if (db_file_exists_hook.invoke<bool>(file))
+			{
+				return true;
+			}
+
+			if (fastfiles::usermap_exists(file))
+			{
+				return true;
+			}
+
+			const auto localized = find_usermap_localized(std::string(file) + ".ff");
+			if (localized == INVALID_HANDLE_VALUE)
+			{
+				return false;
+			}
+			CloseHandle(localized);
+			return true;
+		}
+
+		template <typename T> inline void merge(std::vector<T>* target, T* source, size_t length)
+		{
+			if (source)
+			{
+				for (size_t i = 0; i < length; ++i)
+				{
+					target->push_back(source[i]);
+				}
+			}
+		}
+
+		template <typename T> inline void merge(std::vector<T>* target, std::vector<T> source)
+		{
+			for (auto& entry : source)
+			{
+				target->push_back(entry);
+			}
+		}
+
+		void load_fastfiles1_stub(game::XZoneInfo* zoneInfo, unsigned int zoneCount, game::DBSyncMode syncMode)
+		{
+			std::vector<game::XZoneInfo> data;
+			merge(&data, zoneInfo, zoneCount);
+			const auto inuse_flags = game::DB_Zones_GetInUseFlags();
+
+			const auto flags_not_in_use = [&](int flags)
+			{
+				return (inuse_flags & flags) == 0;
+			};
+
+			const auto add_zone = [&](const char* name, const int flags, const int free_flags = 0)
+			{
+				if (flags_not_in_use(flags))
+				{
+					if (fastfiles::exists(name))
+					{
+						data.push_back({ name, flags, free_flags });
+					}
+				}
+			};
+
+			// Don't quote me on this:
+			// TIER1 is MP and CP
+			// TIER2 is mode specific
+
+			add_zone("iw7mod_global_mp", game::DB_ZONE_GLOBAL_TIER1 | game::DB_ZONE_CUSTOM, 1);
+
+			if (!game::environment::is_dedi())
+			{
+				add_zone("iw7mod_ui_mp", game::DB_ZONE_UI | game::DB_ZONE_CUSTOM, 0);
+
+				static std::vector<std::string> art_zones;
+				art_zones.clear();
+				if (std::filesystem::exists("usermaps"))
+				{
+					for (const auto& entry : std::filesystem::directory_iterator("usermaps"))
+					{
+						if (entry.is_directory())
+						{
+							art_zones.emplace_back(entry.path().filename().string() + "_art");
+						}
+					}
+				}
+
+				for (const auto& zone : art_zones)
+				{
+					add_zone(zone.data(), game::DB_ZONE_GLOBAL_TIER1 | game::DB_ZONE_CUSTOM, 1);
+				}
+			}
+
+			add_zone("mod", game::DB_ZONE_GLOBAL_TIER1 | game::DB_ZONE_CUSTOM, 1);
+
+			game::DB_LoadXAssets(data.data(), static_cast<std::uint32_t>(data.size()), syncMode);
+		}
+
+		void load_fastfiles2_stub(game::XZoneInfo* zoneInfo, unsigned int zoneCount, game::DBSyncMode syncMode)
+		{
+			std::vector<game::XZoneInfo> data;
+			merge(&data, zoneInfo, zoneCount);
+
+			const auto add_zone = [&](const char* name)
+			{
+				if (fastfiles::exists(name))
+				{
+					data.push_back({ name, game::DB_ZONE_PERMANENT | game::DB_ZONE_CUSTOM, 0 });
+				}
+			};
+
+			add_zone("iw7mod_code_post_gfx");
+
+			game::DB_LoadXAssets(data.data(), static_cast<std::uint32_t>(data.size()), syncMode);
+		}
+
+		void reallocate_asset_pool(const game::XAssetType type, const unsigned int new_size)
+		{
+			const size_t element_size = game::DB_GetXAssetTypeSize(type);
+
+			auto* new_pool = utils::memory::get_allocator()->allocate(new_size * element_size);
+			std::memmove(new_pool, game::g_assetPool[type], game::g_poolSize[type] * element_size);
+
+			game::g_assetPool[type] = new_pool;
+			game::g_poolSize[type] = new_size;
+		}
+
+		void db_init_pool(void* pool, int count, size_t elemSize)
+		{
+			char* base = (char*)pool;
+
+			void* first = base + sizeof(void*);
+			*(void**)base = first;
+
+			void* current = first;
+
+			for (int i = 1; i < count; ++i)
+			{
+				void* next = base + sizeof(void*) + i * elemSize;
+				*(void**)current = next;
+				current = next;
+			}
+
+			*(void**)current = nullptr;
+		}
+
+		template<int Type>
+		void pool_init_wrapper(void* pool)
+		{
+			db_init_pool(
+				pool,
+				game::g_poolSize[Type],
+				game::DB_GetXAssetTypeSize((game::XAssetType)Type)
+			);
+		}
+
+		void db_init_thread_stub()
+		{
+			reallocate_asset_pool(game::ASSET_TYPE_STRINGTABLE, 800); // originally 400
+			reallocate_asset_pool(game::ASSET_TYPE_FX, 2048); // originally 16, iw6 uses 2048
+
+#define INIT_ASSET_POOL(x) \
+    pool_inits[x] = pool_init_wrapper<x>;
+
+			auto* pool_inits = reinterpret_cast<void(**)(void*)>(0x141466650);
+
+			INIT_ASSET_POOL(game::ASSET_TYPE_PHYSICSLIBRARY)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PHYSICS_SFX_EVENT_ASSET)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PHYSICS_VFX_EVENT_ASSET)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PHYSICSASSET)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PHYSICS_FX_PIPELINE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PHYSICS_FX_SHAPE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_XANIMPARTS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_XMODEL_SURFS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_XMODEL)
+			INIT_ASSET_POOL(game::ASSET_TYPE_MAYHEM)
+			INIT_ASSET_POOL(game::ASSET_TYPE_MATERIAL)
+			INIT_ASSET_POOL(game::ASSET_TYPE_COMPUTESHADER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VERTEXSHADER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_HULLSHADER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_DOMAINSHADER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PIXELSHADER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VERTEXDECL)
+			INIT_ASSET_POOL(game::ASSET_TYPE_TECHNIQUE_SET)
+			INIT_ASSET_POOL(game::ASSET_TYPE_IMAGE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SOUND_GLOBALS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SOUND_BANK)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SOUND_BANK_TRANSIENT)
+			INIT_ASSET_POOL(game::ASSET_TYPE_CLIPMAP)
+			INIT_ASSET_POOL(game::ASSET_TYPE_COMWORLD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_GLASSWORLD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PATHDATA)
+			INIT_ASSET_POOL(game::ASSET_TYPE_NAVMESH)
+			INIT_ASSET_POOL(game::ASSET_TYPE_MAP_ENTS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_FXWORLD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_GFXWORLD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_GFXWORLD_TRANSIENT_ZONE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_IESPROFILE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_LIGHT_DEF)
+			INIT_ASSET_POOL(game::ASSET_TYPE_UI_MAP)
+			INIT_ASSET_POOL(game::ASSET_TYPE_ANIMCLASS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PLAYERANIM)
+			INIT_ASSET_POOL(game::ASSET_TYPE_GESTURE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_LOCALIZE_ENTRY)
+			INIT_ASSET_POOL(game::ASSET_TYPE_ATTACHMENT)
+			INIT_ASSET_POOL(game::ASSET_TYPE_WEAPON)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VFX)
+			INIT_ASSET_POOL(game::ASSET_TYPE_FX)
+			INIT_ASSET_POOL(game::ASSET_TYPE_IMPACT_FX)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SURFACE_FX)
+			INIT_ASSET_POOL(game::ASSET_TYPE_AITYPE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_MPTYPE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_CHARACTER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_XMODELALIAS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_RAWFILE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SCRIPTFILE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_STRINGTABLE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_LEADERBOARD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VIRTUAL_LEADERBOARD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_STRUCTURED_DATA_DEF)
+			INIT_ASSET_POOL(game::ASSET_TYPE_DDL)
+			INIT_ASSET_POOL(game::ASSET_TYPE_TRACER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VEHICLE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_ADDON_MAP_ENTS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_NET_CONST_STRINGS)
+			INIT_ASSET_POOL(game::ASSET_TYPE_LUA_FILE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SCRIPTABLE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_EQUIPMENT_SND_TABLE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VECTORFIELD)
+			INIT_ASSET_POOL(game::ASSET_TYPE_PARTICLE_SIM_ANIMATION)
+			INIT_ASSET_POOL(game::ASSET_TYPE_STREAMING_INFO)
+			INIT_ASSET_POOL(game::ASSET_TYPE_LASER)
+			INIT_ASSET_POOL(game::ASSET_TYPE_TTF)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SUIT)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SUITANIMPACKAGE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SPACESHIPTARGET)
+			INIT_ASSET_POOL(game::ASSET_TYPE_RUMBLE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_RUMBLE_GRAPH)
+			INIT_ASSET_POOL(game::ASSET_TYPE_ANIM_PACKAGE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_SFX_PACKAGE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_VFX_PACKAGE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_BEHAVIOR_TREE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_XANIM_ARCHETYPE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_XANIM_PROCEDURALBONES)
+			INIT_ASSET_POOL(game::ASSET_TYPE_RETICLE)
+			INIT_ASSET_POOL(game::ASSET_TYPE_GFXLIGHTMAP)
+
+#undef INIT_ASSET_POOL
+
+			utils::hook::invoke<void>(0x140A77DC0); // original call
+		}
+	}
+
+	namespace zone_loading
+	{
+		utils::hook::detour db_is_patch_hook;
+		utils::hook::detour physics_asset_post_load_hook;
+
+		struct hk_packfile_header
+		{
+			std::uint32_t magic[2];
+			std::int32_t user_tag;
+			std::int32_t file_version;
+			std::uint8_t layout_rules[4];
+			std::int32_t num_sections;
+			std::int32_t contents_section_index;
+			std::int32_t contents_section_offset;
+			std::int32_t contents_class_name_section_index;
+			std::int32_t contents_class_name_section_offset;
+			char contents_version[16];
+			std::uint32_t flags;
+			std::int32_t pad;
+		};
+		static_assert(offsetof(hk_packfile_header, layout_rules) == 16);
+		static_assert(offsetof(hk_packfile_header, contents_version) == 40);
+		static_assert(offsetof(hk_packfile_header, flags) == 56);
+
+		const char* invalid_havok_data(const game::PhysicsAsset* asset)
+		{
+			if (!asset->havokData || !asset->havokDataSize)
+			{
+				return "no havok data";
+			}
+
+			if (reinterpret_cast<std::uintptr_t>(asset->havokData) & 3)
+			{
+				return "havok data not 4 byte aligned";
+			}
+
+			const auto* header = reinterpret_cast<const hk_packfile_header*>(asset->havokData);
+			if (header->magic[0] != 0x57E0E057 || header->magic[1] != 0x10C0C010)
+			{
+				return "no packfile magic";
+			}
+
+			const std::uint8_t layout[4] = { 8, 1, 0, 1 };
+			if (std::memcmp(header->layout_rules, layout, sizeof(layout)))
+			{
+				return "packfile layout differs from the platform's";
+			}
+
+			if (static_cast<std::uint8_t>(header->contents_version[0]) == 0xFF ||
+				std::strncmp(header->contents_version, "hk_2014.2.5-r1", sizeof(header->contents_version)))
+			{
+				return "packfile contents version differs";
+			}
+
+			if (header->flags & 1)
+			{
+				return "packfile already loaded";
+			}
+
+			return nullptr;
+		}
+
+		void physics_asset_post_load_stub(game::PhysicsAsset* asset)
+		{
+			if (const auto* reason = invalid_havok_data(asset))
+			{
+				console::error("Physics asset \"%s\" skipped: %s\n", asset->name ? asset->name : "?", reason);
+				return;
+			}
+
+			physics_asset_post_load_hook.invoke<void>(asset);
+		}
+
+		bool check_missing_content_func(const char* zone_name)
+		{
+			const char* lang_code = game::SEH_GetCurrentLanguageCode();
+			char buffer[0x100]{ 0 };
+			const auto len = sprintf_s(buffer, "%s_", lang_code);
+
+			if (!strncmp(zone_name, buffer, len))
+			{
+				console::warn("Tried to load missing language zone: %s\n", zone_name);
+				return true;
+			}
+
+			return false;
+		}
+
+		bool db_is_patch_stub(const char* name)
+		{
+			if (db_is_patch_hook.invoke<bool>(name)) return true;
+			if (check_missing_content_func(name)) return true;
+			return false;
+		}
+
+		void skip_extra_zones_stub(utils::hook::assembler& a)
+		{
+			const auto skip = a.newLabel();
+			const auto original = a.newLabel();
+
+			//a.pushad64();
+			a.test(edi, game::DB_ZONE_CUSTOM); // allocFlags
+			a.jnz(skip);
+
+			a.bind(original);
+			//a.popad64();
+			a.call(0x1403BC450); // strnicmp_ffotd
+			a.mov(r12d, edi);
+			a.mov(rdx, 0x141467970); // "patch_"
+			a.jmp(0x1403BA9C0);
+
+			a.bind(skip);
+			//a.popad64();
+			a.mov(r12d, game::DB_ZONE_CUSTOM);
+			a.not_(r12d);
+			a.and_(edi, r12d);
+			a.jmp(0x1403BAC06);
+		}
+	}
+	using namespace zone_loading;
+
+	bool exists(const std::string& zone, bool ignore_usermap)
+	{
+		const auto is_localized = game::DB_IsLocalized(zone.data());
+		const auto handle = sys_create_file((is_localized ? game::SF_ZONE_LOC : game::SF_ZONE),
+			utils::string::va("%s.ff", zone.data()), ignore_usermap);
+
+		if (handle != INVALID_HANDLE_VALUE)
+		{
+			CloseHandle(handle);
+			return true;
+		}
+
+		return false;
+	}
+
+	void set_usermap(const std::string& usermap)
+	{
+		current_usermap.access([&](std::optional<std::string>& current_usermap_)
+		{
+			current_usermap_ = usermap;
+		});
+	}
+
+	void clear_usermap()
+	{
+		current_usermap.access([&](std::optional<std::string>& current_usermap_)
+		{
+			current_usermap_.reset();
+		});
+	}
+
+	std::optional<std::string> get_current_usermap()
+	{
+		return current_usermap.access<std::optional<std::string>>([&](
+			std::optional<std::string>& current_usermap_)
+		{
+			return current_usermap_;
+		});
+	}
+
+	bool usermap_exists(const std::string& name)
+	{
+		if (is_stock_map(name))
+		{
+			return false;
+		}
+
+		return utils::io::file_exists(utils::string::va("usermaps\\%s\\%s.ff", name.data(), name.data()));
+	}
+
+	bool is_stock_map(const std::string& name)
+	{
+		return fastfiles::exists(name, true);
+	}
+
+	class component final : public component_interface
+	{
+	public:
+		void post_unpack() override
+		{
+			db_try_load_x_file_internal_hook.create(0x1403BBC40, db_try_load_x_file_internal_stub);
+#if defined(DEBUG) and defined(XFILE_DEBUG)
+			db_init_load_x_file_hook.create(0x1409E8D10, db_init_load_x_file_stub);
+#else
+			db_load_x_zone_hook.create(0x1403BA920, db_load_x_zone_stub);
+#endif
+
+			db_find_xasset_header_hook.create(game::DB_FindXAssetHeader, db_find_xasset_header_stub);
+			db_add_xasset_hook.create(0x140A76520, db_add_xasset_stub);
+
+			g_dump_scripts = game::Dvar_RegisterBool("g_dumpScripts", false, game::DVAR_FLAG_NONE, "Dump GSC scripts");
+
+			// Don't fatal on certain missing zones
+			db_is_patch_hook.create(0x1403BC580, db_is_patch_stub);
+			physics_asset_post_load_hook.create(0x140572690, physics_asset_post_load_stub);
+
+			// Don't load extra zones with loadzone
+			utils::hook::nop(0x1403BA9B1, 15);
+			utils::hook::jump(0x1403BA9B1, utils::hook::assemble(skip_extra_zones_stub), true);
+
+			// Allow loading of unsigned fastfiles
+			utils::hook::set<uint8_t>(0x1409E8CAE, 0xEB); // DB_InflateInit
+
+			// Skip signature validation
+			utils::hook::set(0x1409E6390, 0xC301B0);
+
+			// Add custom zone paths
+			sys_createfile_hook.create(game::Sys_CreateFile, sys_create_file_stub);
+			db_file_exists_hook.create(game::DB_FileExists, db_file_exists_stub);
+
+			// Add custom zones in fastfiles load
+			// (global,common)
+			utils::hook::call(0x1405ADB63, load_fastfiles1_stub);
+			// (code_post_gfx)
+			utils::hook::call(0x140E0624B, load_fastfiles2_stub);
+
+			// reallocate assets
+			utils::hook::call(0x140A77EA4, db_init_thread_stub);
+
+			command::add("loadzone", [](const command::params& params)
+			{
+				if (params.size() < 2)
+				{
+					console::info("usage: loadzone <zone>\n");
+					return;
+				}
+
+				const char* name = params.get(1);
+
+				if (!fastfiles::exists(name))
+				{
+					console::warn("loadzone: zone %s could not be found!\n", name);
+					return;
+				}
+
+				game::XZoneInfo info{};
+				info.name = name;
+				info.allocFlags = game::DB_ZONE_PERMANENT;
+				info.allocFlags |= game::DB_ZONE_CUSTOM; // skip extra zones with this flag
+
+				game::DB_LoadXAssets(&info, 1, game::DBSyncMode::DB_LOAD_ASYNC);
+			});
+
+			command::add("listassetpool", [](const command::params& params)
+			{
+				if (params.size() < 2)
+				{
+					console::info("listassetpool <poolnumber> [filter]: list all the assets in the specified pool\n");
+
+					for (auto i = 0; i < game::XAssetType::ASSET_TYPE_COUNT; i++)
+					{
+						console::info("%d %s\n", i, game::g_assetNames[i]);
+					}
+					return;
+				}
+
+				const auto type = static_cast<game::XAssetType>(atoi(params.get(1)));
+
+				if (type < 0 || type >= game::XAssetType::ASSET_TYPE_COUNT)
+				{
+					console::error("Invalid pool passed must be between [%d, %d]\n", 0, game::XAssetType::ASSET_TYPE_COUNT - 1);
+					return;
+				}
+
+				console::info("Listing assets in pool %s\n", game::g_assetNames[type]);
+
+				const std::string filter = params.get(2);
+				game::DB_EnumXAssets(type, [type, filter](const game::XAssetHeader header)
+				{
+					const game::XAsset asset{ type, header };
+					const auto* const asset_name = game::DB_GetXAssetName(&asset);
+
+					if (!filter.empty() && !utils::string::match_compare(filter, asset_name, false))
+					{
+						return;
+					}
+
+					console::info("%s\n", asset_name);
+				});
+			});
+		}
+	};
+}
+
+REGISTER_COMPONENT(fastfiles::component)
